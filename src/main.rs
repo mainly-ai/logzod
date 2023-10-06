@@ -65,10 +65,6 @@ async fn main() {
         .unwrap_or("250".into())
         .parse::<u64>()
         .expect("Failed to parse bucket long interval as u64");
-    let bucket_short_interval = std::env::var("LOG_BUCKET_SHORT_INTERVAL")
-        .unwrap_or("25".into())
-        .parse::<u64>()
-        .expect("Failed to parse bucket short interval as u64");
 
     let config = mirmod_rs::config::MirandaConfig::new_from_default()
         .expect("Failed to load default config from system paths")
@@ -174,11 +170,7 @@ async fn main() {
         }
     });
 
-    let mut log_pusher = RatelimitedLogPusher::new(
-        Duration::from_millis(bucket_long_interval),
-        Duration::from_millis(bucket_short_interval),
-        tx,
-    );
+    let mut log_pusher = RatelimitedLogPusher::new(Duration::from_millis(bucket_long_interval), tx);
 
     let mut line = String::new();
 
@@ -275,19 +267,13 @@ struct RatelimitedLogPusherSharedState {
 struct RatelimitedLogPusher {
     handle: Option<JoinHandle<()>>,
     long_push_interval: Duration,
-    short_push_interval: Duration,
     shared_state: Arc<Mutex<RatelimitedLogPusherSharedState>>,
 }
 
 impl RatelimitedLogPusher {
-    fn new(
-        long_push_interval: Duration,
-        short_push_interval: Duration,
-        tx: mpsc::Sender<Vec<LogLine>>,
-    ) -> Self {
+    fn new(long_push_interval: Duration, tx: mpsc::Sender<Vec<LogLine>>) -> Self {
         Self {
             long_push_interval,
-            short_push_interval,
             handle: None,
             shared_state: Arc::new(Mutex::new(RatelimitedLogPusherSharedState {
                 collected: Vec::new(),
@@ -324,11 +310,7 @@ impl RatelimitedLogPusher {
         };
 
         if elapsed > self.long_push_interval {
-            if self.handle.is_none() {
-                self.reset_timeout(self.short_push_interval).await;
-            } else {
-                self.push_logs().await;
-            }
+            self.push_logs().await;
         } else {
             self.reset_timeout(self.long_push_interval).await;
         }
