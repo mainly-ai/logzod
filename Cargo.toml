@@ -1,0 +1,14 @@
+[package]
+name = "logzod"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+mirmod-rs = { path = "../mirmod-rs" }
+tokio = { version = "1.32.0", features = ["full"] }
+serde = "1.0.107"
+serde_json = "1.0.107"
+chrono = "0.4.31"
+serde_json_any_key = "2.0.0"
