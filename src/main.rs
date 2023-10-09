@@ -21,7 +21,7 @@ fn match_line_to_tag(line: &str) -> LogLevel {
         return LogLevel::Warning;
     } else if line.starts_with("[ERROR]") {
         return LogLevel::Error;
-    } else if line.starts_with("[DEBUG]") {
+    } else if line.starts_with("[DEBUG]") || line.starts_with("|=>") {
         return LogLevel::Debug;
     }
     LogLevel::Default
@@ -206,7 +206,7 @@ async fn main() {
         match stderr_reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
-                log_pusher.log(line.clone(), LogLevel::Error).await;
+                log_pusher.log(line.clone(), LogLevel::Warning).await;
                 line.clear();
             }
             Err(e) => {
