@@ -232,6 +232,12 @@ async fn main() {
         .await
         .expect("Failed to create security context");
     sc.renew_id().await.expect("Failed to renew ID");
+    let mut ob = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::DockerJob>(&mut sc, docker_job_id)
+        .await
+        .expect("Failed to find docker job");
+    if ob.workflow_state == mirmod_rs::orm::DockerJobWorkflowState::Error {
+        ob.set_workflow_state(mirmod_rs::orm::DockerJobWorkflowState::Exited);
+    }
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
         .expect("Failed to update docker job");
