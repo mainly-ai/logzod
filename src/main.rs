@@ -127,31 +127,36 @@ async fn main() {
 
     tokio::spawn(async move {
         while let Some(loglines) = rx.recv().await {
-            mirmod_rs::orm::MirandaLog::create(
-                &mut sc,
-                loglines
-                    .iter()
-                    .map(|line| line.line.clone())
-                    .collect::<Vec<_>>()
-                    .join(""),
-                0,
-                mirmod_rs::orm::MirandaClasses::DockerJob,
-                docker_job_id.into(),
-            )
-            .await
-            .ok();
-
+            let mut msg_groups = Vec::new();
+            let mut buff_line: std::option::Option<MessageLogPayload> = None;
             let mut chunk = Vec::new();
             for log in &loglines {
                 print!("{}", log.line);
-                chunk.push(MessageLogPayload {
+                let payload = MessageLogPayload {
                     timestamp: log
                         .timestamp
                         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     message: log.line.clone(),
                     tag: log.level as usize,
-                });
+                };
+
+                if let Some(buff) = &mut buff_line {
+                    if buff.to_owned().tag != payload.tag {
+                        msg_groups.push(buff.clone());
+                        buff_line = Some(payload.clone());
+                    } else {
+                        buff.message.push_str(&payload.message);
+                    }
+                } else {
+                    buff_line = Some(payload.clone());
+                }
+
+                chunk.push(payload);
             }
+            if let Some(buff) = buff_line {
+                msg_groups.push(buff);
+            }
+
             let mut payloads = Vec::new();
             recurse_break_logs(vec![chunk], &mut payloads, 0);
             for payload in payloads {
@@ -166,6 +171,18 @@ async fn main() {
                 if let Err(e) = send_res {
                     println!("📜 Failed to send logs: {}", e);
                 }
+            }
+
+            for msg in msg_groups {
+                mirmod_rs::orm::MirandaLog::create(
+                    &mut sc,
+                    msg.message,
+                    msg.tag as i64,
+                    mirmod_rs::orm::MirandaClasses::DockerJob,
+                    docker_job_id.into(),
+                )
+                .await
+                .ok();
             }
         }
     });
