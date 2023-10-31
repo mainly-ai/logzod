@@ -1,6 +1,7 @@
 use std::io::BufRead;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use sysinfo::{CpuExt, NetworkExt, NetworksExt, ProcessExt, System, SystemExt};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -47,9 +48,18 @@ struct Message<T> {
 }
 
 #[derive(serde::Serialize)]
-struct UpdateDockerJobMessagePayload {
+struct UpdateDockerJobWorkflowStateMessagePayload {
     id: i32,
     workflow_state: String,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateDockerJobResourceUsagePayload {
+    id: i32,
+    cpu_seconds: f32,
+    ram_gb_seconds: f32,
+    net_tx_gb: f32,
+    net_rx_gb: f32,
 }
 
 #[tokio::main]
@@ -79,11 +89,12 @@ async fn main() {
         .expect("Failed to create security context");
     sc.renew_id().await.expect("Failed to renew ID");
 
-    let mut ob = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::DockerJob>(&mut sc, docker_job_id)
-        .await
-        .expect("Failed to find docker job");
+    let mut ob =
+        mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(&mut sc, docker_job_id)
+            .await
+            .expect("Failed to find docker job");
 
-    ob.set_workflow_state(mirmod_rs::orm::DockerJobWorkflowState::Starting);
+    ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Starting);
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
         .expect("Failed to update docker job");
@@ -91,7 +102,7 @@ async fn main() {
         &mut sc,
         serde_json::to_string(&Message {
             action: "update[DOCKER_JOB]".into(),
-            data: UpdateDockerJobMessagePayload {
+            data: UpdateDockerJobWorkflowStateMessagePayload {
                 id: docker_job_id,
                 workflow_state: ob.workflow_state.as_str().into(),
             },
@@ -121,6 +132,81 @@ async fn main() {
 
     let mut stdout_reader = std::io::BufReader::new(stdout);
     let mut stderr_reader = std::io::BufReader::new(stderr);
+
+    // resource usage monitor
+    let mut rmon_sc = mirmod_rs::sctx::SecurityContext::new_from_config(config.clone())
+        .await
+        .expect("Failed to create security context");
+    rmon_sc.renew_id().await.expect("Failed to renew ID");
+    tokio::spawn(async move {
+        let mut sys = System::new_all();
+        let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
+            &mut rmon_sc,
+            docker_job_id,
+        )
+        .await
+        .expect("Failed to find docker job");
+
+        let mut last_report = Instant::now();
+        let scan_rate = Duration::from_millis(1000);
+        let report_rate = Duration::from_millis(5000);
+        let second_scaling_factor: f32 = 1.0 / scan_rate.as_secs_f32();
+        let mut total_cpu_usage: f32 = 0.0;
+        let mut total_mem_usage: f32 = 0.0;
+        let mut total_net_tx: f32 = 0.0;
+        let mut total_net_rx: f32 = 0.0;
+
+        sys.refresh_all();
+        tokio::time::sleep(scan_rate).await;
+
+        loop {
+            sys.refresh_cpu();
+            sys.refresh_memory();
+            sys.refresh_networks();
+            for cpu in sys.cpus() {
+                // divide by 100 to convert % to cpu seconds
+                total_cpu_usage += cpu.cpu_usage() * second_scaling_factor / 100.0;
+            }
+            for (interface_name, data) in sys.networks() {
+                if interface_name != "en0" && interface_name != "eth0" {
+                    continue;
+                }
+                total_net_tx += data.transmitted() as f32 / 1024.0 / 1024.0 / 1024.0;
+                total_net_rx += data.received() as f32 / 1024.0 / 1024.0 / 1024.0;
+            }
+            let current_mem_usage_gb = sys.used_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
+            total_mem_usage += current_mem_usage_gb * second_scaling_factor;
+            if last_report.elapsed() > report_rate {
+                last_report = Instant::now();
+                println!(
+                    "📜 [INFO] cpu[{:.2}cs], mem:[{:.4}gbs], net[^{:.4}gb, v{:.4}gb]",
+                    total_cpu_usage, total_mem_usage, total_net_tx, total_net_rx
+                );
+                docker_job.set_cpu_seconds(total_cpu_usage);
+                docker_job.set_ram_gb_seconds(total_mem_usage);
+                mirmod_rs::orm::update(&mut rmon_sc, &mut docker_job)
+                    .await
+                    .ok();
+                mirmod_rs::orm::RealtimeMessage::send_to_self(
+                    &mut rmon_sc,
+                    serde_json::to_string(&Message {
+                        action: "update[DOCKER_JOB]".into(),
+                        data: UpdateDockerJobResourceUsagePayload {
+                            id: docker_job_id,
+                            cpu_seconds: total_cpu_usage,
+                            ram_gb_seconds: total_mem_usage,
+                            net_tx_gb: total_net_tx,
+                            net_rx_gb: total_net_rx,
+                        },
+                    })
+                    .unwrap(),
+                )
+                .await
+                .ok();
+            }
+            tokio::time::sleep(scan_rate).await;
+        }
+    });
 
     let (tx, mut rx) =
         mpsc::channel(100) as (mpsc::Sender<Vec<LogLine>>, mpsc::Receiver<Vec<LogLine>>);
@@ -211,11 +297,11 @@ async fn main() {
     match proc.wait() {
         Ok(status) => {
             println!("📜 Child Process exited with status: {}", status);
-            ob.set_workflow_state(mirmod_rs::orm::DockerJobWorkflowState::Exited);
+            ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Exited);
         }
         Err(e) => {
             println!("📜 Failed to wait for child process: {}", e);
-            ob.set_workflow_state(mirmod_rs::orm::DockerJobWorkflowState::Error);
+            ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Error);
         }
     }
 
@@ -249,11 +335,12 @@ async fn main() {
         .await
         .expect("Failed to create security context");
     sc.renew_id().await.expect("Failed to renew ID");
-    let mut ob = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::DockerJob>(&mut sc, docker_job_id)
-        .await
-        .expect("Failed to find docker job");
-    if ob.workflow_state != mirmod_rs::orm::DockerJobWorkflowState::Error {
-        ob.set_workflow_state(mirmod_rs::orm::DockerJobWorkflowState::Exited);
+    let mut ob =
+        mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(&mut sc, docker_job_id)
+            .await
+            .expect("Failed to find docker job");
+    if ob.workflow_state != mirmod_rs::orm::docker_job::DockerJobWorkflowState::Error {
+        ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Exited);
     }
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
@@ -262,7 +349,7 @@ async fn main() {
         &mut sc,
         serde_json::to_string(&Message {
             action: "update[DOCKER_JOB]".into(),
-            data: UpdateDockerJobMessagePayload {
+            data: UpdateDockerJobWorkflowStateMessagePayload {
                 id: docker_job_id,
                 workflow_state: ob.workflow_state.as_str().into(),
             },
