@@ -87,9 +87,8 @@ async fn main() {
         return;
     }
 
-    let rtmsg_ticket = std::env::var("REALTIME_MESSAGE_TICKER")
-        .expect("Expected a ticket in the environment")
-        .as_str();
+    let rtmsg_ticket =
+        std::env::var("REALTIME_MESSAGE_TICKET").expect("Expected a ticket in the environment");
 
     let bucket_long_interval = std::env::var("LOG_BUCKET_LONG_INTERVAL")
         .unwrap_or("250".into())
@@ -121,7 +120,7 @@ async fn main() {
     mirmod_rs::orm::RealtimeMessage::send_to_ko(
         &mut sc,
         msg.wob_id,
-        rtmsg_ticket.clone().to_string(),
+        rtmsg_ticket.clone(),
         serde_json::to_string(&Message {
             action: "update[DOCKER_JOB]".into(),
             data: UpdateDockerJobWorkflowStateMessagePayload {
@@ -160,7 +159,7 @@ async fn main() {
         .await
         .expect("Failed to create security context");
     rmon_sc.renew_id().await.expect("Failed to renew ID");
-    let rmon_rtmsg_ticket = rtmsg_ticket.clone().to_string();
+    let rmon_rtmsg_ticket = rtmsg_ticket.clone();
     tokio::spawn(async move {
         let mut sys = System::new_all();
         let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
@@ -236,7 +235,7 @@ async fn main() {
     let (tx, mut rx) =
         mpsc::channel(100) as (mpsc::Sender<Vec<LogLine>>, mpsc::Receiver<Vec<LogLine>>);
 
-    let lscn_rtmsg_ticket = rtmsg_ticket.clone().to_string();
+    let lscn_rtmsg_ticket = rtmsg_ticket.clone();
     tokio::spawn(async move {
         while let Some(loglines) = rx.recv().await {
             let mut msg_groups = Vec::new();
@@ -379,7 +378,7 @@ async fn main() {
     mirmod_rs::orm::RealtimeMessage::send_to_ko(
         &mut sc,
         msg.wob_id,
-        rtmsg_ticket.to_string(),
+        rtmsg_ticket,
         serde_json::to_string(&Message {
             action: "update[DOCKER_JOB]".into(),
             data: UpdateDockerJobWorkflowStateMessagePayload {
