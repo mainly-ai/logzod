@@ -62,6 +62,12 @@ struct UpdateDockerJobResourceUsagePayload {
     net_rx_gb: f32,
 }
 
+#[derive(serde::Deserialize)]
+struct WOBMessage {
+    wob_id: i32,
+    wob_type: String,
+}
+
 #[tokio::main]
 async fn main() {
     println!("📜 logzod");
@@ -70,6 +76,20 @@ async fn main() {
         .expect("Expected a docker job id in the environment")
         .parse::<i32>()
         .expect("Failed to parse docker job id as i32");
+
+    let msg: WOBMessage = serde_json::from_str(
+        &std::env::var("WOB_MESSAGE").expect("Expected a message in the environment"),
+    )
+    .expect("Failed to parse message");
+
+    if msg.wob_type != "KNOWLEDGE_OBJECT" {
+        println!("📜 Invalid wob type: {}", msg.wob_type);
+        return;
+    }
+
+    let rtmsg_ticket = std::env::var("REALTIME_MESSAGE_TICKER")
+        .expect("Expected a ticket in the environment")
+        .as_str();
 
     let bucket_long_interval = std::env::var("LOG_BUCKET_LONG_INTERVAL")
         .unwrap_or("250".into())
@@ -98,8 +118,10 @@ async fn main() {
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
         .expect("Failed to update docker job");
-    mirmod_rs::orm::RealtimeMessage::send_to_self(
+    mirmod_rs::orm::RealtimeMessage::send_to_ko(
         &mut sc,
+        msg.wob_id,
+        rtmsg_ticket.clone().to_string(),
         serde_json::to_string(&Message {
             action: "update[DOCKER_JOB]".into(),
             data: UpdateDockerJobWorkflowStateMessagePayload {
@@ -138,6 +160,7 @@ async fn main() {
         .await
         .expect("Failed to create security context");
     rmon_sc.renew_id().await.expect("Failed to renew ID");
+    let rmon_rtmsg_ticket = rtmsg_ticket.clone().to_string();
     tokio::spawn(async move {
         let mut sys = System::new_all();
         let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
@@ -187,8 +210,10 @@ async fn main() {
                 mirmod_rs::orm::update(&mut rmon_sc, &mut docker_job)
                     .await
                     .ok();
-                mirmod_rs::orm::RealtimeMessage::send_to_self(
+                mirmod_rs::orm::RealtimeMessage::send_to_ko(
                     &mut rmon_sc,
+                    msg.wob_id,
+                    rmon_rtmsg_ticket.clone(),
                     serde_json::to_string(&Message {
                         action: "update[DOCKER_JOB]".into(),
                         data: UpdateDockerJobResourceUsagePayload {
@@ -211,6 +236,7 @@ async fn main() {
     let (tx, mut rx) =
         mpsc::channel(100) as (mpsc::Sender<Vec<LogLine>>, mpsc::Receiver<Vec<LogLine>>);
 
+    let lscn_rtmsg_ticket = rtmsg_ticket.clone().to_string();
     tokio::spawn(async move {
         while let Some(loglines) = rx.recv().await {
             let mut msg_groups = Vec::new();
@@ -251,8 +277,13 @@ async fn main() {
                     data: payload,
                 })
                 .unwrap();
-                let send_res =
-                    mirmod_rs::orm::RealtimeMessage::send_to_self(&mut sc, encoded).await;
+                let send_res = mirmod_rs::orm::RealtimeMessage::send_to_ko(
+                    &mut sc,
+                    msg.wob_id,
+                    lscn_rtmsg_ticket.clone(),
+                    encoded,
+                )
+                .await;
 
                 if let Err(e) = send_res {
                     println!("📜 Failed to send logs: {}", e);
@@ -345,8 +376,10 @@ async fn main() {
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
         .expect("Failed to update docker job");
-    mirmod_rs::orm::RealtimeMessage::send_to_self(
+    mirmod_rs::orm::RealtimeMessage::send_to_ko(
         &mut sc,
+        msg.wob_id,
+        rtmsg_ticket.to_string(),
         serde_json::to_string(&Message {
             action: "update[DOCKER_JOB]".into(),
             data: UpdateDockerJobWorkflowStateMessagePayload {
