@@ -171,7 +171,7 @@ async fn main() {
 
         let mut last_report = Instant::now();
         let scan_rate = Duration::from_millis(1000);
-        let report_rate = Duration::from_millis(5000);
+        let report_rate = Duration::from_millis(10000);
         let second_scaling_factor: f32 = 1.0 / scan_rate.as_secs_f32();
         let mut total_cpu_usage: f32 = 0.0;
         let mut total_mem_usage: f32 = 0.0;
@@ -204,6 +204,26 @@ async fn main() {
                     "📜 [INFO] cpu[{:.2}cs], mem:[{:.4}gbs], net[^{:.4}gb, v{:.4}gb]",
                     total_cpu_usage, total_mem_usage, total_net_tx, total_net_rx
                 );
+
+                docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
+                    &mut rmon_sc,
+                    docker_job.id,
+                )
+                .await
+                .expect("Failed to find docker job");
+
+                match docker_job.workflow_state {
+                    mirmod_rs::orm::docker_job::DockerJobWorkflowState::Exited => {
+                        println!("📜 docker job exited, stopping resource monitor");
+                        break;
+                    }
+                    mirmod_rs::orm::docker_job::DockerJobWorkflowState::Error => {
+                        println!("📜 docker job errored, stopping resource monitor");
+                        break;
+                    }
+                    _ => {}
+                }
+
                 docker_job.set_cpu_seconds(total_cpu_usage);
                 docker_job.set_ram_gb_seconds(total_mem_usage);
                 mirmod_rs::orm::update(&mut rmon_sc, &mut docker_job)
@@ -230,6 +250,9 @@ async fn main() {
             }
             tokio::time::sleep(scan_rate).await;
         }
+
+        println!("📜 resource monitor done");
+        std::process::exit(0);
     });
 
     let (tx, mut rx) =
