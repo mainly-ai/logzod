@@ -22,7 +22,9 @@ fn match_line_to_tag(line: &str) -> LogLevel {
         return LogLevel::Warning;
     } else if line.starts_with("[ERROR]") || line.starts_with("ERROR:") {
         return LogLevel::Error;
-    } else if line.starts_with("[DEBUG]") || || line.starts_with("DEBUG:") || line.starts_with("|=>") {
+    } else if line.starts_with("[DEBUG]")
+        || || line.starts_with("DEBUG:") || line.starts_with("|=>")
+    {
         return LogLevel::Debug;
     }
     LogLevel::Default
@@ -162,7 +164,7 @@ async fn main() {
     let rmon_rtmsg_ticket = rtmsg_ticket.clone();
     tokio::spawn(async move {
         let mut sys = System::new_all();
-            let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
+        let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
             &mut rmon_sc,
             docker_job_id,
         )
@@ -223,6 +225,8 @@ async fn main() {
                     }
                     _ => {}
                 }
+
+                rmon_sc.extend_proxy_account_claim().await.ok();
 
                 docker_job.set_cpu_seconds(total_cpu_usage);
                 docker_job.set_ram_gb_seconds(total_mem_usage);
