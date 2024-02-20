@@ -16,13 +16,13 @@ enum LogLevel {
 }
 
 fn match_line_to_tag(line: &str) -> LogLevel {
-    if line.starts_with("[INFO]") {
+    if line.starts_with("[INFO]") || line.starts_with("INFO:") {
         return LogLevel::Info;
-    } else if line.starts_with("[WARN]") {
+    } else if line.starts_with("[WARN]") || line.starts_with("WARN:") {
         return LogLevel::Warning;
-    } else if line.starts_with("[ERROR]") {
+    } else if line.starts_with("[ERROR]") || line.starts_with("ERROR:") {
         return LogLevel::Error;
-    } else if line.starts_with("[DEBUG]") || line.starts_with("|=>") {
+    } else if line.starts_with("[DEBUG]") || || line.starts_with("DEBUG:") || line.starts_with("|=>") {
         return LogLevel::Debug;
     }
     LogLevel::Default
@@ -162,7 +162,7 @@ async fn main() {
     let rmon_rtmsg_ticket = rtmsg_ticket.clone();
     tokio::spawn(async move {
         let mut sys = System::new_all();
-        let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
+            let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
             &mut rmon_sc,
             docker_job_id,
         )
