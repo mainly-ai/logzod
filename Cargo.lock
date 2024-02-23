@@ -743,6 +743,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "dirs",
+ "paste",
  "serde",
  "serde_json",
  "serde_json_any_key",

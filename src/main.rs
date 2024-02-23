@@ -22,9 +22,7 @@ fn match_line_to_tag(line: &str) -> LogLevel {
         return LogLevel::Warning;
     } else if line.starts_with("[ERROR]") || line.starts_with("ERROR:") {
         return LogLevel::Error;
-    } else if line.starts_with("[DEBUG]")
-        || || line.starts_with("DEBUG:") || line.starts_with("|=>")
-    {
+    } else if line.starts_with("[DEBUG]") || line.starts_with("DEBUG:") || line.starts_with("|=>") {
         return LogLevel::Debug;
     }
     LogLevel::Default
