@@ -1,3 +1,4 @@
+use mirmod_rs::orm::ORMObject;
 use std::io::BufRead;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -113,7 +114,7 @@ async fn main() {
             .await
             .expect("Failed to find docker job");
 
-    ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Starting);
+    ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Starting);
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
         .expect("Failed to update docker job");
@@ -125,7 +126,7 @@ async fn main() {
             action: "update[DOCKER_JOB]".into(),
             data: UpdateDockerJobWorkflowStateMessagePayload {
                 id: docker_job_id,
-                workflow_state: ob.workflow_state.as_str().into(),
+                workflow_state: ob.workflow_state().as_str().into(),
             },
         })
         .unwrap(),
@@ -207,17 +208,17 @@ async fn main() {
 
                 docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
                     &mut rmon_sc,
-                    docker_job.id,
+                    docker_job.id(),
                 )
                 .await
                 .expect("Failed to find docker job");
 
-                match docker_job.workflow_state {
-                    mirmod_rs::orm::docker_job::DockerJobWorkflowState::Exited => {
+                match docker_job.workflow_state() {
+                    mirmod_rs::orm::docker_job::WorkflowState::Exited => {
                         println!("📜 docker job exited, stopping resource monitor");
                         break;
                     }
-                    mirmod_rs::orm::docker_job::DockerJobWorkflowState::Error => {
+                    mirmod_rs::orm::docker_job::WorkflowState::Error => {
                         println!("📜 docker job errored, stopping resource monitor");
                         break;
                     }
@@ -352,11 +353,11 @@ async fn main() {
     match proc.wait() {
         Ok(status) => {
             println!("📜 Child Process exited with status: {}", status);
-            ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Exited);
+            ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited);
         }
         Err(e) => {
             println!("📜 Failed to wait for child process: {}", e);
-            ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Error);
+            ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Error);
         }
     }
 
@@ -394,8 +395,8 @@ async fn main() {
         mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(&mut sc, docker_job_id)
             .await
             .expect("Failed to find docker job");
-    if ob.workflow_state != mirmod_rs::orm::docker_job::DockerJobWorkflowState::Error {
-        ob.set_workflow_state(mirmod_rs::orm::docker_job::DockerJobWorkflowState::Exited);
+    if ob.workflow_state() != mirmod_rs::orm::docker_job::WorkflowState::Error {
+        ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited);
     }
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
@@ -408,7 +409,7 @@ async fn main() {
             action: "update[DOCKER_JOB]".into(),
             data: UpdateDockerJobWorkflowStateMessagePayload {
                 id: docker_job_id,
-                workflow_state: ob.workflow_state.as_str().into(),
+                workflow_state: ob.workflow_state().as_str().into(),
             },
         })
         .unwrap(),
