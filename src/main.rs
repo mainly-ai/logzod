@@ -1,5 +1,6 @@
 use mirmod_rs::orm::ORMObject;
 use std::io::BufRead;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{CpuExt, NetworkExt, NetworksExt, ProcessExt, System, SystemExt};
@@ -353,7 +354,10 @@ async fn main() {
     match proc.wait() {
         Ok(status) => {
             println!("📜 Child Process exited with status: {}", status);
-            ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited);
+            match status.code() {
+                Some(0) => ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited),
+                _ => ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Error),
+            }
         }
         Err(e) => {
             println!("📜 Failed to wait for child process: {}", e);
