@@ -1,6 +1,10 @@
+use mirmod_rs::config::MirandaConfig;
 use mirmod_rs::orm::ORMObject;
-use std::io::BufRead;
+use mirmod_rs::sctx::SecurityContext;
+use std::io::{BufRead, Error};
 use std::process::ExitStatus;
+use std::ptr::null;
+use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{CpuExt, NetworkExt, NetworksExt, ProcessExt, System, SystemExt};
@@ -70,99 +74,24 @@ struct WOBMessage {
     wob_type: String,
 }
 
-#[tokio::main]
-async fn main() {
-    println!("📜 logzod");
-    let token = std::env::var("WOB_TOKEN").expect("Expected a token in the environment");
-    let docker_job_id = std::env::var("DOCKER_JOB_ID")
-        .expect("Expected a docker job id in the environment")
-        .parse::<i32>()
-        .expect("Failed to parse docker job id as i32");
-
-    let msg: WOBMessage = serde_json::from_str(
-        &std::env::var("WOB_MESSAGE").expect("Expected a message in the environment"),
-    )
-    .expect("Failed to parse message");
-
-    if msg.wob_type != "KNOWLEDGE_OBJECT" {
-        println!("📜 Invalid wob type: {}", msg.wob_type);
-        return;
-    }
-
-    let rtmsg_ticket =
-        std::env::var("REALTIME_MESSAGE_TICKET").expect("Expected a ticket in the environment");
-
-    let bucket_long_interval = std::env::var("LOG_BUCKET_LONG_INTERVAL")
-        .unwrap_or("250".into())
-        .parse::<u64>()
-        .expect("Failed to parse bucket long interval as u64");
-
-    let config = mirmod_rs::config::MirandaConfig::new_from_default()
-        .expect("Failed to load default config from system paths")
-        .merge_into_new(
-            mirmod_rs::config::PartialMirandaConfig::new_from_token_string(token).expect(
-                "Failed to load partial config from token string (this should never happen)",
-            ),
-        )
-        .expect("Failed to merge configs");
+async fn monitor_resources_and_logs(
+    config:MirandaConfig,
+    docker_job_id: i32,
+    wob_id: i32, // replace with actual type of msg
+    rtmsg_ticket: String,
+    bucket_long_interval: u64
+) -> Result<Option<Box<RatelimitedLogPusher>>,Error> {
+    let lscn_rtmsg_ticket = rtmsg_ticket.clone();
     let mut sc = mirmod_rs::sctx::SecurityContext::new_from_config(config.clone())
-        .await
-        .expect("Failed to create security context");
-    sc.renew_id().await.expect("Failed to renew ID");
-
-    let mut ob =
-        mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(&mut sc, docker_job_id)
             .await
-            .expect("Failed to find docker job");
-
-    ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Starting);
-    mirmod_rs::orm::update(&mut sc, &mut ob)
-        .await
-        .expect("Failed to update docker job");
-    mirmod_rs::orm::RealtimeMessage::send_to_ko(
-        &mut sc,
-        msg.wob_id,
-        rtmsg_ticket.clone(),
-        serde_json::to_string(&Message {
-            action: "update[DOCKER_JOB]".into(),
-            data: UpdateDockerJobWorkflowStateMessagePayload {
-                id: docker_job_id,
-                workflow_state: ob.workflow_state().as_str().into(),
-            },
-        })
-        .unwrap(),
-    )
-    .await
-    .ok();
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = std::process::Command::new(&args[0])
-        .args(&args[1..])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-
-    let mut proc = match cmd {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            println!("📜 Failed to spawn command: {}", e);
-            return;
-        }
-    };
-
-    let stdout = proc.stdout.take().expect("Failed to take stdout");
-    let stderr = proc.stderr.take().expect("Failed to take stderr");
-
-    let mut stdout_reader = std::io::BufReader::new(stdout);
-    let mut stderr_reader = std::io::BufReader::new(stderr);
-
-    // resource usage monitor
-    let mut rmon_sc = mirmod_rs::sctx::SecurityContext::new_from_config(config.clone())
-        .await
-        .expect("Failed to create security context");
-    rmon_sc.renew_id().await.expect("Failed to renew ID");
-    let rmon_rtmsg_ticket = rtmsg_ticket.clone();
+            .expect("Failed to create security context");
+    sc.renew_id().await.expect("Failed to renew ID");
+    // Spawn the first task for resource monitoring
     tokio::spawn(async move {
+        let mut rmon_sc = mirmod_rs::sctx::SecurityContext::new_from_config(config.clone())
+            .await
+            .expect("Failed to create security context");
+        rmon_sc.renew_id().await.expect("Failed to renew ID");
         let mut sys = System::new_all();
         let mut docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
             &mut rmon_sc,
@@ -235,8 +164,8 @@ async fn main() {
                     .ok();
                 mirmod_rs::orm::RealtimeMessage::send_to_ko(
                     &mut rmon_sc,
-                    msg.wob_id,
-                    rmon_rtmsg_ticket.clone(),
+                    wob_id,
+                    lscn_rtmsg_ticket.clone(),
                     serde_json::to_string(&Message {
                         action: "update[DOCKER_JOB]".into(),
                         data: UpdateDockerJobResourceUsagePayload {
@@ -259,14 +188,13 @@ async fn main() {
         std::process::exit(0);
     });
 
+    // Channel for log processing
     let (tx, mut rx) =
-        mpsc::channel(100) as (mpsc::Sender<Vec<LogLine>>, mpsc::Receiver<Vec<LogLine>>);
-
-    let lscn_rtmsg_ticket = rtmsg_ticket.clone();
+        tokio::sync::mpsc::channel(100) as (tokio::sync::mpsc::Sender<Vec<LogLine>>, tokio::sync::mpsc::Receiver<Vec<LogLine>>);
     tokio::spawn(async move {
         while let Some(loglines) = rx.recv().await {
             let mut msg_groups = Vec::new();
-            let mut buff_line: std::option::Option<MessageLogPayload> = None;
+            let mut buff_line: Option<MessageLogPayload> = None;
             let mut chunk = Vec::new();
             for log in &loglines {
                 print!("{}", log.line);
@@ -305,8 +233,8 @@ async fn main() {
                 .unwrap();
                 let send_res = mirmod_rs::orm::RealtimeMessage::send_to_ko(
                     &mut sc,
-                    msg.wob_id,
-                    lscn_rtmsg_ticket.clone(),
+                    wob_id,
+                    rtmsg_ticket.clone(),
                     encoded,
                 )
                 .await;
@@ -329,65 +257,183 @@ async fn main() {
             }
         }
     });
+    let log_pusher= Some(Box::new(RatelimitedLogPusher::new(Duration::from_millis(bucket_long_interval), tx)));
+    Ok(log_pusher)
+}
 
-    let mut log_pusher = RatelimitedLogPusher::new(Duration::from_millis(bucket_long_interval), tx);
+#[tokio::main]
+async fn main() {
+    println!("📜 logzod");
+    let token = std::env::var("WOB_TOKEN").expect("Expected a token in the environment");
+    let docker_job_id = std::env::var("DOCKER_JOB_ID")
+        .expect("Expected a docker job id in the environment")
+        .parse::<i32>()
+        .expect("Failed to parse docker job id as i32");
 
-    let mut line = String::new();
+    let msg: WOBMessage = serde_json::from_str(
+        &std::env::var("WOB_MESSAGE").expect("Expected a message in the environment"),
+    )
+    .expect("Failed to parse message");
 
+    if msg.wob_type != "KNOWLEDGE_OBJECT" {
+        println!("📜 Invalid wob type: {}", msg.wob_type);
+        return;
+    }
+
+    let rtmsg_ticket =
+        std::env::var("REALTIME_MESSAGE_TICKET").expect("Expected a ticket in the environment");
+
+    let bucket_long_interval = std::env::var("LOG_BUCKET_LONG_INTERVAL")
+        .unwrap_or("250".into())
+        .parse::<u64>()
+        .expect("Failed to parse bucket long interval as u64");
+
+    let config = mirmod_rs::config::MirandaConfig::new_from_default()
+        .expect("Failed to load default config from system paths")
+        .merge_into_new(
+            mirmod_rs::config::PartialMirandaConfig::new_from_token_string(token).expect(
+                "Failed to load partial config from token string (this should never happen)",
+            ),
+        )
+        .expect("Failed to merge configs");
+    let mut sc = mirmod_rs::sctx::SecurityContext::new_from_config(config.clone())
+        .await
+        .expect("Failed to create security context");
+    sc.renew_id().await.expect("Failed to renew ID");
+
+    let mut ob =
+        mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(&mut sc, docker_job_id)
+            .await
+            .expect("Failed to find docker job");
+
+    ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Starting);
+    mirmod_rs::orm::update(&mut sc, &mut ob)
+        .await
+        .expect("Failed to update docker job");
+    mirmod_rs::orm::RealtimeMessage::send_to_ko(
+        &mut sc,
+        msg.wob_id,
+        rtmsg_ticket.clone(),
+        serde_json::to_string(&Message {
+            action: "update[DOCKER_JOB]".into(),
+            data: UpdateDockerJobWorkflowStateMessagePayload {
+                id: docker_job_id,
+                workflow_state: ob.workflow_state().as_str().into(),
+            },
+        })
+        .unwrap(),
+    )
+    .await
+    .ok();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut quit = false;
+    println!("📜 Spawining new processor.");
     loop {
-        match stdout_reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                log_pusher.log(line.clone(), match_line_to_tag(&line)).await;
-                line.clear();
-            }
+        let mut log_pusher:Option<Box<RatelimitedLogPusher>>=None;
+        let cmd = std::process::Command::new(&args[0])
+            .args(&args[1..])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+
+        let mut proc = match cmd {
+            Ok(cmd) => cmd,
             Err(e) => {
-                println!("📜 Failed to read line: {}", e);
-                break;
+                println!("📜 Failed to spawn command: {}", e);
+                return;
             }
+        };
+
+        let stdout = proc.stdout.take().expect("Failed to take stdout");
+        let stderr = proc.stderr.take().expect("Failed to take stderr");
+
+        let mut stdout_reader = std::io::BufReader::new(stdout);
+        let mut stderr_reader = std::io::BufReader::new(stderr);
+
+        // resource usage monitor
+        let rmon_rtmsg_ticket = rtmsg_ticket.clone();
+        if log_pusher.is_none() {
+            let result = monitor_resources_and_logs(
+                config.clone(),
+                docker_job_id,
+                msg.wob_id,
+                rmon_rtmsg_ticket,
+                bucket_long_interval,
+            ).await.expect("Failed to start resource monitor.");
+
+            log_pusher.get_or_insert_with(|| {
+                result.expect("Failed to setup the log pusher.") // Assign the result to log_pusher
+            });
         }
-    }
-
-    println!("📜 stdout done");
-
-    // wait for the process to exit
-    match proc.wait() {
-        Ok(status) => {
-            println!("📜 Child Process exited with status: {}", status);
-            match status.code() {
-                Some(0) => ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited),
-                _ => ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Error),
-            }
-        }
-        Err(e) => {
-            println!("📜 Failed to wait for child process: {}", e);
-            ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Error);
-        }
-    }
-
-    loop {
-        match stderr_reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                log_pusher.log(line.clone(), LogLevel::Warning).await;
-                line.clear();
-            }
-            Err(e) => {
-                println!("📜 Failed to read line: {}", e);
-                break;
-            }
-        }
-    }
-
-    println!("📜 stderr done");
-
-    if let Some(handle) = log_pusher.handle.take() {
+        let mut line = String::new();
+        let mut pusher = log_pusher.unwrap();
         loop {
-            if handle.is_finished() {
-                break;
+            match stdout_reader.read_line(&mut line) {
+                Ok(0) => break, // End of file reached, break the loop
+                Ok(_) => {
+                    pusher.log(line.clone(), match_line_to_tag(&line)).await;
+                    line.clear(); // Clear the line for the next input
+                }
+                Err(e) => {
+                    println!("📜 Failed to read line: {}", e);
+                    break;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+
+        println!("📜 stdout done");
+        let mut dont_get_stderr= false;
+        // wait for the process to exit
+        match proc.wait() {
+            Ok(status) => {
+                println!("📜 Child Process exited with status: {}", status);
+                match status.code() {
+                    Some(0) => {
+                        ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited);
+                        quit= true;
+                    },
+                    Some(200) => {
+                        println!("📜 Process requested restart.");
+                        dont_get_stderr= true;
+                    },
+                    _ => ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Error),
+                }
+            }
+            Err(e) => {
+                println!("📜 Failed to wait for child process: {}", e);
+                ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Error);
+            }
+        }
+
+        if dont_get_stderr == false {
+            loop {
+                match stderr_reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        pusher.log(line.clone(), LogLevel::Warning).await;
+                        line.clear();
+                    }
+                    Err(e) => {
+                        println!("📜 Failed to read line: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        println!("📜 stderr done");
+
+        if let Some(handle) = pusher.handle.take() {
+            loop {
+                if handle.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        if quit  { break; }
+        println!("📜 Respawning processor.");
     }
 
     // the security context was moved to a new thread, so we need to create a new one to update the docker job
@@ -435,7 +481,7 @@ struct RatelimitedLogPusherSharedState {
 struct RatelimitedLogPusher {
     handle: Option<JoinHandle<()>>,
     long_push_interval: Duration,
-    shared_state: Arc<Mutex<RatelimitedLogPusherSharedState>>,
+    shared_state: Arc<Mutex<RatelimitedLogPusherSharedState>>, // Propagate the lifetime here
 }
 
 impl RatelimitedLogPusher {
