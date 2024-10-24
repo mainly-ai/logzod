@@ -1,13 +1,10 @@
 use mirmod_rs::config::MirandaConfig;
+use mirmod_rs::orm::bigdecimal::ToPrimitive;
 use mirmod_rs::orm::ORMObject;
-use mirmod_rs::sctx::SecurityContext;
 use std::io::{BufRead, Error};
-use std::process::ExitStatus;
-use std::ptr::null;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sysinfo::{CpuExt, NetworkExt, NetworksExt, ProcessExt, System, SystemExt};
+use sysinfo::{CpuExt, NetworkExt, System, SystemExt};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -75,16 +72,16 @@ struct WOBMessage {
 }
 
 async fn monitor_resources_and_logs(
-    config:MirandaConfig,
+    config: MirandaConfig,
     docker_job_id: i32,
     wob_id: i32, // replace with actual type of msg
     rtmsg_ticket: String,
-    bucket_long_interval: u64
-) -> Result<Option<Box<RatelimitedLogPusher>>,Error> {
+    bucket_long_interval: u64,
+) -> Result<Option<Box<RatelimitedLogPusher>>, Error> {
     let lscn_rtmsg_ticket = rtmsg_ticket.clone();
     let mut sc = mirmod_rs::sctx::SecurityContext::new_from_config(config.clone())
-            .await
-            .expect("Failed to create security context");
+        .await
+        .expect("Failed to create security context");
     sc.renew_id().await.expect("Failed to renew ID");
     // Spawn the first task for resource monitoring
     tokio::spawn(async move {
@@ -99,6 +96,18 @@ async fn monitor_resources_and_logs(
         )
         .await
         .expect("Failed to find docker job");
+
+        let crg: Option<mirmod_rs::orm::crg::ComputeResourceGroup> = match docker_job.crg_id() {
+            Some(crg_id) => Some(
+                mirmod_rs::orm::find_by_id::<mirmod_rs::orm::crg::ComputeResourceGroup>(
+                    &mut rmon_sc,
+                    crg_id,
+                )
+                .await
+                .expect("Failed to find compute resource group"),
+            ),
+            None => None,
+        };
 
         let mut last_report = Instant::now();
         let scan_rate = Duration::from_millis(1000);
@@ -130,9 +139,52 @@ async fn monitor_resources_and_logs(
             let current_mem_usage_gb = sys.used_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
             total_mem_usage += current_mem_usage_gb * second_scaling_factor;
             if last_report.elapsed() > report_rate {
+                if let Some(crg) = &crg {
+                    let seconds_since_last_report = last_report.elapsed().as_secs_f64();
+
+                    let d_cpu = (total_cpu_usage - docker_job.cpu_seconds()) as f64
+                        / seconds_since_last_report;
+                    let d_mem = (total_mem_usage - docker_job.ram_gb_seconds()) as f64
+                        / seconds_since_last_report;
+                    let d_net_tx =
+                        (total_net_tx - docker_job.net_tx_gb()) as f64 / seconds_since_last_report;
+                    let d_net_rx =
+                        (total_net_rx - docker_job.net_rx_gb()) as f64 / seconds_since_last_report;
+
+                    let credit_cost = (d_cpu / 3600.0 * crg.cost_per_cpu_hour().to_f64().unwrap())
+                        + (d_mem / 3600.0 * crg.cost_per_gb_hour().to_f64().unwrap())
+                        + (d_net_tx / 3600.0 * crg.cost_per_net_tx_gb().to_f64().unwrap())
+                        + (d_net_rx / 3600.0 * crg.cost_per_net_rx_gb().to_f64().unwrap());
+
+                    println!("📜 [INFO] 💸 d_cpu[{:.2}cs], d_mem:[{:.4}gbs], d_net[^{:.4}gb, v{:.4}gb], cost:{:.4}",
+                        d_cpu, d_mem, d_net_tx, d_net_rx, credit_cost);
+
+                    let statement = format!(
+                        "{:.4},CPU:{:.4},MEM:{:.4},NTX:{:.4},NRX:{:.4}",
+                        docker_job.id(),
+                        d_cpu,
+                        d_mem,
+                        d_net_tx,
+                        d_net_rx
+                    );
+
+                    if let Ok(amount) = mirmod_rs::orm::BigDecimal::try_from(credit_cost) {
+                        match mirmod_rs::orm::transact_credits(&mut rmon_sc, amount, &statement)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                println!("📜 Failed to transact credits: {}", e);
+                                println!("📜 Killing the process.");
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 last_report = Instant::now();
                 println!(
-                    "📜 [INFO] cpu[{:.2}cs], mem:[{:.4}gbs], net[^{:.4}gb, v{:.4}gb]",
+                    "📜 [INFO] 📈 cpu[{:.2}cs], mem:[{:.4}gbs], net[^{:.4}gb, v{:.4}gb]",
                     total_cpu_usage, total_mem_usage, total_net_tx, total_net_rx
                 );
 
@@ -183,14 +235,27 @@ async fn monitor_resources_and_logs(
             }
             tokio::time::sleep(scan_rate).await;
         }
-
-        println!("📜 resource monitor done");
+        println!("📜 resource monitor done, ensuring workflow_state = WorkflowState::Exited");
+        loop {
+            docker_job.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited);
+            match mirmod_rs::orm::update(&mut rmon_sc, &mut docker_job).await {
+                Ok(_) => break,
+                Err(e) => {
+                    println!("📜 Failed to update docker job: {}", e);
+                }
+            }
+            println!("📜 Retrying in 10s");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
         std::process::exit(0);
     });
 
     // Channel for log processing
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel(100) as (tokio::sync::mpsc::Sender<Vec<LogLine>>, tokio::sync::mpsc::Receiver<Vec<LogLine>>);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100)
+        as (
+            tokio::sync::mpsc::Sender<Vec<LogLine>>,
+            tokio::sync::mpsc::Receiver<Vec<LogLine>>,
+        );
     tokio::spawn(async move {
         while let Some(loglines) = rx.recv().await {
             let mut msg_groups = Vec::new();
@@ -257,7 +322,10 @@ async fn monitor_resources_and_logs(
             }
         }
     });
-    let log_pusher= Some(Box::new(RatelimitedLogPusher::new(Duration::from_millis(bucket_long_interval), tx)));
+    let log_pusher = Some(Box::new(RatelimitedLogPusher::new(
+        Duration::from_millis(bucket_long_interval),
+        tx,
+    )));
     Ok(log_pusher)
 }
 
@@ -318,7 +386,7 @@ async fn main() {
             action: "update[DOCKER_JOB]".into(),
             data: UpdateDockerJobWorkflowStateMessagePayload {
                 id: docker_job_id,
-                workflow_state: ob.workflow_state().as_str().into(),
+                workflow_state: ob.workflow_state().as_str(),
             },
         })
         .unwrap(),
@@ -330,7 +398,7 @@ async fn main() {
     let mut quit = false;
     println!("📜 Spawining new processor.");
     loop {
-        let mut log_pusher:Option<Box<RatelimitedLogPusher>>=None;
+        let mut log_pusher: Option<Box<RatelimitedLogPusher>> = None;
         let cmd = std::process::Command::new(&args[0])
             .args(&args[1..])
             .stdout(std::process::Stdio::piped())
@@ -360,7 +428,9 @@ async fn main() {
                 msg.wob_id,
                 rmon_rtmsg_ticket,
                 bucket_long_interval,
-            ).await.expect("Failed to start resource monitor.");
+            )
+            .await
+            .expect("Failed to start resource monitor.");
 
             log_pusher.get_or_insert_with(|| {
                 result.expect("Failed to setup the log pusher.") // Assign the result to log_pusher
@@ -383,7 +453,7 @@ async fn main() {
         }
 
         println!("📜 stdout done");
-        let mut dont_get_stderr= false;
+        let mut dont_get_stderr = false;
         // wait for the process to exit
         match proc.wait() {
             Ok(status) => {
@@ -391,12 +461,12 @@ async fn main() {
                 match status.code() {
                     Some(0) => {
                         ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited);
-                        quit= true;
-                    },
+                        quit = true;
+                    }
                     Some(200) => {
                         println!("📜 Process requested restart.");
-                        dont_get_stderr= true;
-                    },
+                        dont_get_stderr = true;
+                    }
                     _ => ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Error),
                 }
             }
@@ -406,7 +476,7 @@ async fn main() {
             }
         }
 
-        if dont_get_stderr == false {
+        if !dont_get_stderr {
             loop {
                 match stderr_reader.read_line(&mut line) {
                     Ok(0) => break,
@@ -432,7 +502,9 @@ async fn main() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        if quit  { break; }
+        if quit {
+            break;
+        }
         println!("📜 Respawning processor.");
     }
 
