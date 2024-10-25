@@ -145,20 +145,19 @@ async fn monitor_resources_and_logs(
             let current_mem_usage_gb = sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             total_mem_usage += current_mem_usage_gb * second_scaling_factor;
 
-            let mut update_data = DockerJobResourceUsagePayload {
-                id: docker_job_id,
-                cpu_seconds: total_cpu_usage,
-                current_cpu: 0.0,
-                ram_gb_seconds: total_mem_usage,
-                current_ram_gb: 0.0,
-                net_tx_gb: total_net_tx,
-                current_net_tx_gb: 0.0,
-                net_rx_gb: total_net_rx,
-                current_net_rx_gb: 0.0,
-                total_cost,
-            };
-
             if last_report.elapsed() > report_rate {
+                let mut update_data = DockerJobResourceUsagePayload {
+                    id: docker_job_id,
+                    cpu_seconds: total_cpu_usage,
+                    current_cpu: 0.0,
+                    ram_gb_seconds: total_mem_usage,
+                    current_ram_gb: 0.0,
+                    net_tx_gb: total_net_tx,
+                    current_net_tx_gb: 0.0,
+                    net_rx_gb: total_net_rx,
+                    current_net_rx_gb: 0.0,
+                    total_cost,
+                };
                 docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
                     &mut rmon_sc,
                     docker_job.id(),
@@ -208,15 +207,17 @@ async fn monitor_resources_and_logs(
                         update_data.current_net_rx_gb
                     );
 
-                    if let Ok(amount) = mirmod_rs::orm::BigDecimal::try_from(credit_cost) {
-                        match mirmod_rs::orm::transact_credits(&mut rmon_sc, amount, &statement)
-                            .await
-                        {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("📜 Failed to transact credits: {}", e);
-                                println!("📜 Killing the process.");
-                                break;
+                    if credit_cost > 0.0 {
+                        if let Ok(amount) = mirmod_rs::orm::BigDecimal::try_from(credit_cost) {
+                            match mirmod_rs::orm::transact_credits(&mut rmon_sc, amount, &statement)
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    println!("📜 Failed to transact credits: {}", e);
+                                    println!("📜 Killing the process.");
+                                    break;
+                                }
                             }
                         }
                     }
