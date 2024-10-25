@@ -428,8 +428,8 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut quit = false;
     println!("📜 Spawining new processor.");
+    let mut log_pusher: Option<Box<RatelimitedLogPusher>> = None;
     loop {
-        let mut log_pusher: Option<Box<RatelimitedLogPusher>> = None;
         let cmd = std::process::Command::new(&args[0])
             .args(&args[1..])
             .stdout(std::process::Stdio::piped())
@@ -468,12 +468,16 @@ async fn main() {
             });
         }
         let mut line = String::new();
-        let mut pusher = log_pusher.unwrap();
+        // let mut pusher = log_pusher.unwrap();
         loop {
             match stdout_reader.read_line(&mut line) {
                 Ok(0) => break, // End of file reached, break the loop
                 Ok(_) => {
-                    pusher.log(line.clone(), match_line_to_tag(&line)).await;
+                    log_pusher
+                        .as_mut()
+                        .unwrap()
+                        .log(line.clone(), match_line_to_tag(&line))
+                        .await;
                     line.clear(); // Clear the line for the next input
                 }
                 Err(e) => {
@@ -512,7 +516,11 @@ async fn main() {
                 match stderr_reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
-                        pusher.log(line.clone(), LogLevel::Warning).await;
+                        log_pusher
+                            .as_mut()
+                            .unwrap()
+                            .log(line.clone(), LogLevel::Warning)
+                            .await;
                         line.clear();
                     }
                     Err(e) => {
@@ -525,7 +533,7 @@ async fn main() {
 
         println!("📜 stderr done");
 
-        if let Some(handle) = pusher.handle.take() {
+        if let Some(handle) = log_pusher.as_mut().unwrap().handle.take() {
             loop {
                 if handle.is_finished() {
                     break;
