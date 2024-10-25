@@ -57,12 +57,17 @@ struct UpdateDockerJobWorkflowStateMessagePayload {
 }
 
 #[derive(serde::Serialize)]
-struct UpdateDockerJobResourceUsagePayload {
+struct DockerJobResourceUsagePayload {
     id: i32,
-    cpu_seconds: f32,
-    ram_gb_seconds: f32,
-    net_tx_gb: f32,
-    net_rx_gb: f32,
+    cpu_seconds: f64,
+    current_cpu: f64,
+    ram_gb_seconds: f64,
+    current_ram_gb: f64,
+    net_rx_gb: f64,
+    current_net_rx_gb: f64,
+    net_tx_gb: f64,
+    current_net_tx_gb: f64,
+    total_cost: f64,
 }
 
 #[derive(serde::Deserialize)]
@@ -112,11 +117,12 @@ async fn monitor_resources_and_logs(
         let mut last_report = Instant::now();
         let scan_rate = Duration::from_millis(1000);
         let report_rate = Duration::from_millis(10000);
-        let second_scaling_factor: f32 = 1.0 / scan_rate.as_secs_f32();
-        let mut total_cpu_usage: f32 = 0.0;
-        let mut total_mem_usage: f32 = 0.0;
-        let mut total_net_tx: f32 = 0.0;
-        let mut total_net_rx: f32 = 0.0;
+        let second_scaling_factor: f64 = 1.0 / scan_rate.as_secs_f64();
+        let mut total_cpu_usage: f64 = 0.0;
+        let mut total_mem_usage: f64 = 0.0;
+        let mut total_net_tx: f64 = 0.0;
+        let mut total_net_rx: f64 = 0.0;
+        let mut total_cost: f64 = 0.0;
 
         sys.refresh_all();
         tokio::time::sleep(scan_rate).await;
@@ -127,45 +133,79 @@ async fn monitor_resources_and_logs(
             sys.refresh_networks();
             for cpu in sys.cpus() {
                 // divide by 100 to convert % to cpu seconds
-                total_cpu_usage += cpu.cpu_usage() * second_scaling_factor / 100.0;
+                total_cpu_usage += cpu.cpu_usage() as f64 * second_scaling_factor / 100.0;
             }
             for (interface_name, data) in sys.networks() {
                 if interface_name != "en0" && interface_name != "eth0" {
                     continue;
                 }
-                total_net_tx += data.transmitted() as f32 / 1024.0 / 1024.0 / 1024.0;
-                total_net_rx += data.received() as f32 / 1024.0 / 1024.0 / 1024.0;
+                total_net_tx += data.transmitted() as f64 / 1024.0 / 1024.0 / 1024.0;
+                total_net_rx += data.received() as f64 / 1024.0 / 1024.0 / 1024.0;
             }
-            let current_mem_usage_gb = sys.used_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
+            let current_mem_usage_gb = sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             total_mem_usage += current_mem_usage_gb * second_scaling_factor;
+
+            let mut update_data = DockerJobResourceUsagePayload {
+                id: docker_job_id,
+                cpu_seconds: total_cpu_usage,
+                current_cpu: 0.0,
+                ram_gb_seconds: total_mem_usage,
+                current_ram_gb: 0.0,
+                net_tx_gb: total_net_tx,
+                current_net_tx_gb: 0.0,
+                net_rx_gb: total_net_rx,
+                current_net_rx_gb: 0.0,
+                total_cost,
+            };
+
             if last_report.elapsed() > report_rate {
+                docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
+                    &mut rmon_sc,
+                    docker_job.id(),
+                )
+                .await
+                .expect("Failed to find docker job");
+
                 if let Some(crg) = &crg {
                     let seconds_since_last_report = last_report.elapsed().as_secs_f64();
+                    last_report = Instant::now();
 
-                    let d_cpu = (total_cpu_usage - docker_job.cpu_seconds()) as f64
+                    update_data.current_cpu = (total_cpu_usage - docker_job.cpu_seconds() as f64)
                         / seconds_since_last_report;
-                    let d_mem = (total_mem_usage - docker_job.ram_gb_seconds()) as f64
+                    docker_job.set_current_cpu(update_data.current_cpu as f32);
+                    update_data.current_ram_gb = (total_mem_usage
+                        - docker_job.ram_gb_seconds() as f64)
                         / seconds_since_last_report;
-                    let d_net_tx =
-                        (total_net_tx - docker_job.net_tx_gb()) as f64 / seconds_since_last_report;
-                    let d_net_rx =
-                        (total_net_rx - docker_job.net_rx_gb()) as f64 / seconds_since_last_report;
+                    docker_job.set_current_ram_gb(update_data.current_ram_gb as f32);
+                    update_data.current_net_tx_gb =
+                        (total_net_tx - docker_job.net_tx_gb() as f64) / seconds_since_last_report;
+                    docker_job.set_current_net_tx_gb(update_data.current_net_tx_gb as f32);
+                    update_data.current_net_rx_gb =
+                        (total_net_rx - docker_job.net_rx_gb() as f64) / seconds_since_last_report;
+                    docker_job.set_current_net_rx_gb(update_data.current_net_rx_gb as f32);
 
-                    let credit_cost = (d_cpu / 3600.0 * crg.cost_per_cpu_hour().to_f64().unwrap())
-                        + (d_mem / 3600.0 * crg.cost_per_gb_hour().to_f64().unwrap())
-                        + (d_net_tx / 3600.0 * crg.cost_per_net_tx_gb().to_f64().unwrap())
-                        + (d_net_rx / 3600.0 * crg.cost_per_net_rx_gb().to_f64().unwrap());
+                    let credit_cost = (update_data.current_cpu / 3600.0
+                        * crg.cost_per_cpu_hour().to_f64().unwrap())
+                        + (update_data.current_ram_gb / 3600.0
+                            * crg.cost_per_gb_hour().to_f64().unwrap())
+                        + (update_data.current_net_tx_gb / 3600.0
+                            * crg.cost_per_net_tx_gb().to_f64().unwrap())
+                        + (update_data.current_net_rx_gb / 3600.0
+                            * crg.cost_per_net_rx_gb().to_f64().unwrap());
+                    total_cost += credit_cost;
+                    update_data.total_cost = total_cost;
+                    docker_job.set_total_cost(total_cost as f32);
 
-                    println!("📜 [INFO] 💸 d_cpu[{:.2}cs], d_mem:[{:.4}gbs], d_net[^{:.4}gb, v{:.4}gb], cost:{:.4}",
-                        d_cpu, d_mem, d_net_tx, d_net_rx, credit_cost);
+                    println!("📜 [INFO] 💸 d_cpu[{:.2}cs], d_mem:[{:.4}gbs], d_net[^{:.4}gb, v{:.4}gb], cost:{:.4} + {:.4}",
+                        update_data.current_cpu, update_data.current_ram_gb, update_data.current_net_tx_gb, update_data.current_net_rx_gb, total_cost, credit_cost);
 
                     let statement = format!(
                         "{:.4},CPU:{:.4},MEM:{:.4},NTX:{:.4},NRX:{:.4}",
                         docker_job.id(),
-                        d_cpu,
-                        d_mem,
-                        d_net_tx,
-                        d_net_rx
+                        update_data.current_cpu,
+                        update_data.current_ram_gb,
+                        update_data.current_net_tx_gb,
+                        update_data.current_net_rx_gb
                     );
 
                     if let Ok(amount) = mirmod_rs::orm::BigDecimal::try_from(credit_cost) {
@@ -180,20 +220,14 @@ async fn monitor_resources_and_logs(
                             }
                         }
                     }
+                } else {
+                    last_report = Instant::now();
                 }
 
-                last_report = Instant::now();
                 println!(
                     "📜 [INFO] 📈 cpu[{:.2}cs], mem:[{:.4}gbs], net[^{:.4}gb, v{:.4}gb]",
                     total_cpu_usage, total_mem_usage, total_net_tx, total_net_rx
                 );
-
-                docker_job = mirmod_rs::orm::find_by_id::<mirmod_rs::orm::docker_job::DockerJob>(
-                    &mut rmon_sc,
-                    docker_job.id(),
-                )
-                .await
-                .expect("Failed to find docker job");
 
                 match docker_job.workflow_state() {
                     mirmod_rs::orm::docker_job::WorkflowState::Exited => {
@@ -209,8 +243,10 @@ async fn monitor_resources_and_logs(
 
                 rmon_sc.extend_proxy_account_claim().await.ok();
 
-                docker_job.set_cpu_seconds(total_cpu_usage);
-                docker_job.set_ram_gb_seconds(total_mem_usage);
+                docker_job.set_cpu_seconds(total_cpu_usage as f32);
+                docker_job.set_ram_gb_seconds(total_mem_usage as f32);
+                docker_job.set_net_rx_gb(total_net_rx as f32);
+                docker_job.set_net_tx_gb(total_net_tx as f32);
                 mirmod_rs::orm::update(&mut rmon_sc, &mut docker_job)
                     .await
                     .ok();
@@ -220,13 +256,7 @@ async fn monitor_resources_and_logs(
                     lscn_rtmsg_ticket.clone(),
                     serde_json::to_string(&Message {
                         action: "update[DOCKER_JOB]".into(),
-                        data: UpdateDockerJobResourceUsagePayload {
-                            id: docker_job_id,
-                            cpu_seconds: total_cpu_usage,
-                            ram_gb_seconds: total_mem_usage,
-                            net_tx_gb: total_net_tx,
-                            net_rx_gb: total_net_rx,
-                        },
+                        data: update_data,
                     })
                     .unwrap(),
                 )
