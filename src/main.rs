@@ -187,9 +187,9 @@ async fn monitor_resources_and_logs(
                         * crg.cost_per_cpu_hour().to_f64().unwrap())
                         + (update_data.current_ram_gb / 3600.0
                             * crg.cost_per_gb_hour().to_f64().unwrap())
-                        + (update_data.current_net_tx_gb / 3600.0
+                        + (update_data.current_net_tx_gb
                             * crg.cost_per_net_tx_gb().to_f64().unwrap())
-                        + (update_data.current_net_rx_gb / 3600.0
+                        + (update_data.current_net_rx_gb
                             * crg.cost_per_net_rx_gb().to_f64().unwrap());
                     total_cost += credit_cost;
                     update_data.total_cost = total_cost;
