@@ -139,8 +139,8 @@ async fn monitor_resources_and_logs(
                 if interface_name != "en0" && interface_name != "eth0" {
                     continue;
                 }
-                total_net_tx += data.transmitted() as f64 / 1024.0 / 1024.0 / 1024.0;
-                total_net_rx += data.received() as f64 / 1024.0 / 1024.0 / 1024.0;
+                total_net_tx += (data.transmitted() as f64 / 1024.0 / 1024.0 / 1024.0).max(0.0);
+                total_net_rx += (data.received() as f64 / 1024.0 / 1024.0 / 1024.0).max(0.0);
             }
             let current_mem_usage_gb = sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             total_mem_usage += current_mem_usage_gb * second_scaling_factor;
@@ -176,11 +176,13 @@ async fn monitor_resources_and_logs(
                         - docker_job.ram_gb_seconds() as f64)
                         / seconds_since_last_report;
                     docker_job.set_current_ram_gb(update_data.current_ram_gb as f32);
-                    update_data.current_net_tx_gb =
-                        (total_net_tx - docker_job.net_tx_gb() as f64) / seconds_since_last_report;
+                    update_data.current_net_tx_gb = (total_net_tx - docker_job.net_tx_gb() as f64)
+                        .max(0.0)
+                        / seconds_since_last_report;
                     docker_job.set_current_net_tx_gb(update_data.current_net_tx_gb as f32);
-                    update_data.current_net_rx_gb =
-                        (total_net_rx - docker_job.net_rx_gb() as f64) / seconds_since_last_report;
+                    update_data.current_net_rx_gb = (total_net_rx - docker_job.net_rx_gb() as f64)
+                        .max(0.0)
+                        / seconds_since_last_report;
                     docker_job.set_current_net_rx_gb(update_data.current_net_rx_gb as f32);
 
                     let credit_cost = (update_data.current_cpu / 3600.0
