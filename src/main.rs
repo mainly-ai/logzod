@@ -185,14 +185,26 @@ async fn monitor_resources_and_logs(
                         / seconds_since_last_report;
                     docker_job.set_current_net_rx_gb(update_data.current_net_rx_gb as f32);
 
-                    let credit_cost = (update_data.current_cpu / 3600.0
+                    let mut credit_cost = (update_data.current_cpu / 3600.0
                         * crg.cost_per_cpu_hour().to_f64().unwrap())
+                    .max(0.0)
                         + (update_data.current_ram_gb / 3600.0
                             * crg.cost_per_gb_hour().to_f64().unwrap())
+                        .max(0.0)
                         + (update_data.current_net_tx_gb
                             * crg.cost_per_net_tx_gb().to_f64().unwrap())
+                        .max(0.0)
                         + (update_data.current_net_rx_gb
-                            * crg.cost_per_net_rx_gb().to_f64().unwrap());
+                            * crg.cost_per_net_rx_gb().to_f64().unwrap())
+                        .max(0.0);
+
+                    if docker_job.gpu_capacity() > 0.0 {
+                        credit_cost += (docker_job.gpu_capacity() as f64 / 3600.0
+                            * crg.cost_per_gpu_hour().to_f64().unwrap()
+                            * seconds_since_last_report)
+                            .max(0.0);
+                    }
+
                     total_cost += credit_cost;
                     update_data.total_cost = total_cost;
                     docker_job.set_total_cost(total_cost as f32);
