@@ -476,6 +476,7 @@ async fn main() {
                     30,
                 )
                 .await;
+                mirmod_rs::debug_println!("📜 should_kill: {}", should_kill);
                 if should_kill {
                     query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
                     match query_proc.try_write() {
@@ -595,7 +596,7 @@ async fn main() {
         }
 
         query_handle.abort();
-        if proc_said_quit || cdc_said_quit.load(std::sync::atomic::Ordering::Relaxed) {
+        if proc_said_quit && !cdc_said_quit.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
         println!("📜 Respawning processor.");
