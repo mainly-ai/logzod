@@ -5,8 +5,8 @@ use std::io::{BufRead, Error};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{CpuExt, NetworkExt, System, SystemExt};
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
 #[derive(Copy, Clone)]
@@ -440,29 +440,67 @@ async fn main() {
     .ok();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut quit = false;
     println!("📜 Spawining new processor.");
     let mut log_pusher: Option<Box<RatelimitedLogPusher>> = None;
     loop {
+        let mut proc_said_quit = false;
+        let cdc_said_quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let cmd = std::process::Command::new(&args[0])
             .args(&args[1..])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn();
 
-        let mut proc = match cmd {
-            Ok(cmd) => cmd,
+        let proc = match cmd {
+            Ok(cmd) => Arc::new(RwLock::new(cmd)),
             Err(e) => {
                 println!("📜 Failed to spawn command: {}", e);
                 return;
             }
         };
 
-        let stdout = proc.stdout.take().expect("Failed to take stdout");
-        let stderr = proc.stderr.take().expect("Failed to take stderr");
+        // SELECT /* WAITING_FOR_EVENT ({}) */ SLEEP({})".format(self.wob_id,s)
+        // if query is killed, set quit to false and break
+        // otherwise, re-run the query, run in thread
+        let mut query_sc = sc.clone();
+        let query_proc = proc.clone();
+        let query_cdc_said_quit = cdc_said_quit.clone();
+        let query_handle = tokio::spawn(async move {
+            // Run a query that waits for an event or times out
+            // If the query is killed, it means we should quit
+            loop {
+                let should_kill = mirmod_rs::orm::wait_for_cdc_event(
+                    &mut query_sc,
+                    format!("{}-logzod_kill", msg.wob_id),
+                    30,
+                )
+                .await;
+                if should_kill {
+                    query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
+                    match query_proc.try_write() {
+                        Ok(mut proc) => match proc.kill() {
+                            Ok(_) => {}
+                            Err(e) => {
+                                println!("📜 Failed to kill query: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            println!("📜 Failed to kill query: {}", e);
+                        }
+                    }
+                    break;
+                }
+            }
+        });
 
-        let mut stdout_reader = std::io::BufReader::new(stdout);
-        let mut stderr_reader = std::io::BufReader::new(stderr);
+        let (mut stdout_reader, mut stderr_reader) = {
+            let mut rproc = proc.write().await;
+            (
+                std::io::BufReader::new(rproc.stdout.take().expect("Failed to take stdout")),
+                std::io::BufReader::new(rproc.stderr.take().expect("Failed to take stderr")),
+            )
+        };
 
         // resource usage monitor
         let rmon_rtmsg_ticket = rtmsg_ticket.clone();
@@ -504,13 +542,13 @@ async fn main() {
         println!("📜 stdout done");
         let mut dont_get_stderr = false;
         // wait for the process to exit
-        match proc.wait() {
+        match proc.write().await.wait() {
             Ok(status) => {
                 println!("📜 Child Process exited with status: {}", status);
                 match status.code() {
                     Some(0) => {
                         ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Exited);
-                        quit = true;
+                        proc_said_quit = true;
                     }
                     Some(200) => {
                         println!("📜 Process requested restart.");
@@ -555,7 +593,9 @@ async fn main() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        if quit {
+
+        query_handle.abort();
+        if proc_said_quit || cdc_said_quit.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
         println!("📜 Respawning processor.");
