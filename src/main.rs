@@ -488,9 +488,9 @@ async fn main() {
                 )
                 .await;
                 if let Ok(events) = events {
-                    mirmod_rs::debug_println!("📜 events: {:?}", events);
                     for event in events {
-                        if let Ok(payload) = serde_json::from_str::<EventPayload>(&event.payload) {
+                        mirmod_rs::debug_println!("📜 event: {:?}", event);
+                        if let Ok(payload) = serde_json::from_value::<EventPayload>(event.payload) {
                             if payload.action == "restart" {
                                 mirmod_rs::debug_println!(
                                     "📜 restart event received, setting restart flag"
@@ -511,7 +511,7 @@ async fn main() {
                                 }
                             }
                         } else {
-                            mirmod_rs::debug_println!("📜 invalid event payload: {:?}", event);
+                            mirmod_rs::debug_println!("📜 invalid event payload");
                         }
                     }
                 } else {
@@ -614,21 +614,32 @@ async fn main() {
 
         if let Some(handle) = log_pusher.as_mut().unwrap().handle.take() {
             loop {
-                if handle.is_finished() {
+                if handle.is_finished() || cdc_said_quit.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
 
+        println!("📜 log pusher done");
+
         query_handle.abort();
         if proc_said_quit && !cdc_said_quit.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
+        mirmod_rs::debug_println!("📜 we should restart");
+        // create a new security context, as the previous one might still be in use by the cdc monitor thread
+        let mut sc = mirmod_rs::sctx::SecurityContext::new_from_config(config.clone())
+            .await
+            .expect("Failed to create security context");
+        sc.renew_id().await.expect("Failed to renew ID");
+
         ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Restarting);
         mirmod_rs::orm::update(&mut sc, &mut ob)
             .await
             .expect("Failed to update docker job");
+        mirmod_rs::debug_println!("📜 updated docker job");
         mirmod_rs::orm::RealtimeMessage::send_to_ko(
             &mut sc,
             msg.wob_id,
@@ -644,6 +655,7 @@ async fn main() {
         )
         .await
         .ok();
+        mirmod_rs::debug_println!("📜 sent update message");
         println!("📜 Respawning processor.");
     }
 
