@@ -467,6 +467,10 @@ async fn main() {
         let query_proc = proc.clone();
         let query_cdc_said_quit = cdc_said_quit.clone();
         let query_handle = tokio::spawn(async move {
+            #[derive(serde::Deserialize)]
+            struct EventPayload {
+                action: String,
+            }
             // Run a query that waits for an event or times out
             // If the query is killed, it means we should quit
             loop {
@@ -482,21 +486,24 @@ async fn main() {
                 if let Ok(events) = events {
                     mirmod_rs::debug_println!("📜 events: {:?}", events);
                     for event in events {
-                        if event.payload == "restart" {
-                            mirmod_rs::debug_println!(
-                                "📜 restart event received, setting restart flag"
-                            );
-                            query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
-                            mirmod_rs::debug_println!("📜 killing process");
-                            match query_proc.try_write() {
-                                Ok(mut proc) => match proc.kill() {
-                                    Ok(_) => {}
+                        if let Ok(payload) = serde_json::from_str::<EventPayload>(&event.payload) {
+                            if payload.action == "restart" {
+                                mirmod_rs::debug_println!(
+                                    "📜 restart event received, setting restart flag"
+                                );
+                                query_cdc_said_quit
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                mirmod_rs::debug_println!("📜 killing process");
+                                match query_proc.try_write() {
+                                    Ok(mut proc) => match proc.kill() {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            println!("📜 Failed to kill process: {}", e);
+                                        }
+                                    },
                                     Err(e) => {
                                         println!("📜 Failed to kill process: {}", e);
                                     }
-                                },
-                                Err(e) => {
-                                    println!("📜 Failed to kill process: {}", e);
                                 }
                             }
                         }
@@ -612,6 +619,25 @@ async fn main() {
         if proc_said_quit && !cdc_said_quit.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
+        ob.set_workflow_state(mirmod_rs::orm::docker_job::WorkflowState::Restarting);
+        mirmod_rs::orm::update(&mut sc, &mut ob)
+            .await
+            .expect("Failed to update docker job");
+        mirmod_rs::orm::RealtimeMessage::send_to_ko(
+            &mut sc,
+            msg.wob_id,
+            rtmsg_ticket.clone(),
+            serde_json::to_string(&Message {
+                action: "update[DOCKER_JOB]".into(),
+                data: UpdateDockerJobWorkflowStateMessagePayload {
+                    id: docker_job_id,
+                    workflow_state: ob.workflow_state().as_str(),
+                },
+            })
+            .unwrap(),
+        )
+        .await
+        .ok();
         println!("📜 Respawning processor.");
     }
 
