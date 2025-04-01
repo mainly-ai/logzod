@@ -474,8 +474,12 @@ async fn main() {
             // Run a query that waits for an event or times out
             // If the query is killed, it means we should quit
             loop {
-                mirmod_rs::orm::wait_for_cdc_event(&mut query_sc, format!("{}", msg.wob_id), 30)
-                    .await;
+                mirmod_rs::orm::wait_for_cdc_event(
+                    &mut query_sc,
+                    format!("{}-logzod", msg.wob_id),
+                    30,
+                )
+                .await;
                 mirmod_rs::debug_println!("📜 sleep query timed out, polling for event");
                 let events = mirmod_rs::orm::WOBMessage::consume_queue(
                     &mut query_sc,
