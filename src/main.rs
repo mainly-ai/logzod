@@ -470,27 +470,40 @@ async fn main() {
             // Run a query that waits for an event or times out
             // If the query is killed, it means we should quit
             loop {
-                let should_kill = mirmod_rs::orm::wait_for_cdc_event(
+                mirmod_rs::orm::wait_for_cdc_event(&mut query_sc, format!("{}", msg.wob_id), 30)
+                    .await;
+                mirmod_rs::debug_println!("📜 sleep query timed out, polling for event");
+                let events = mirmod_rs::orm::WOBMessage::consume_queue(
                     &mut query_sc,
-                    format!("{}-logzod_kill", msg.wob_id),
-                    30,
+                    "logzod".into(),
+                    Some(msg.wob_id),
                 )
                 .await;
-                mirmod_rs::debug_println!("📜 should_kill: {}", should_kill);
-                if should_kill {
-                    query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
-                    match query_proc.try_write() {
-                        Ok(mut proc) => match proc.kill() {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("📜 Failed to kill query: {}", e);
+                if let Ok(events) = events {
+                    mirmod_rs::debug_println!("📜 events: {:?}", events);
+                    for event in events {
+                        if event.payload == "restart" {
+                            mirmod_rs::debug_println!(
+                                "📜 restart event received, setting restart flag"
+                            );
+                            query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
+                            mirmod_rs::debug_println!("📜 killing process");
+                            match query_proc.try_write() {
+                                Ok(mut proc) => match proc.kill() {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        println!("📜 Failed to kill process: {}", e);
+                                    }
+                                },
+                                Err(e) => {
+                                    println!("📜 Failed to kill process: {}", e);
+                                }
                             }
-                        },
-                        Err(e) => {
-                            println!("📜 Failed to kill query: {}", e);
                         }
                     }
-                    break;
+                } else {
+                    mirmod_rs::debug_println!("📜 error consuming queue: {:?}", events);
+                    continue;
                 }
             }
         });
