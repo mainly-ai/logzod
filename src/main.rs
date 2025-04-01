@@ -506,6 +506,8 @@ async fn main() {
                                     }
                                 }
                             }
+                        } else {
+                            mirmod_rs::debug_println!("📜 invalid event payload: {:?}", event);
                         }
                     }
                 } else {
