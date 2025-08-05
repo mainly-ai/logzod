@@ -1,0 +1,156 @@
+name: Build and Release Binaries
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: logzod
+            release_name: logzod-linux-x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: logzod
+            release_name: logzod-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: logzod
+            release_name: logzod-macos-aarch64
+
+    steps:
+    - name: Checkout logzod
+      uses: actions/checkout@v4
+      with:
+        path: logzod
+
+    - name: Checkout mirmod-rs
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/mirmod-rs
+        path: mirmod-rs
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          logzod/target
+        key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.target }}-
+          ${{ runner.os }}-cargo-
+
+    - name: Build binary
+      working-directory: logzod
+      run: |
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: Prepare binary
+      working-directory: logzod
+      run: |
+        cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.release_name }}
+        if [ "${{ matrix.os }}" = "macos-latest" ]; then
+          # Sign the binary on macOS (optional, remove if you don't have signing set up)
+          # codesign -s - ${{ matrix.release_name }}
+          echo "macOS binary prepared"
+        fi
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ matrix.release_name }}
+        path: logzod/${{ matrix.release_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: ./artifacts
+
+    - name: Display structure of downloaded files
+      run: ls -la ./artifacts/
+
+    - name: Generate release tag
+      id: tag
+      run: |
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        else
+          echo "tag=build-$(date +'%Y%m%d')-$(echo $GITHUB_SHA | cut -c1-7)" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        release_name: Release ${{ steps.tag.outputs.tag }}
+        body: |
+          Automated release for commit ${{ github.sha }}
+          
+          ## Binaries
+          - `logzod-linux-x86_64`: Linux x86_64 binary
+          - `logzod-macos-x86_64`: macOS x86_64 (Intel) binary  
+          - `logzod-macos-aarch64`: macOS ARM64 (Apple Silicon) binary
+        draft: false
+        prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+    - name: Upload Linux Binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./artifacts/logzod-linux-x86_64/logzod-linux-x86_64
+        asset_name: logzod-linux-x86_64
+        asset_content_type: application/octet-stream
+
+    - name: Upload macOS x86_64 Binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./artifacts/logzod-macos-x86_64/logzod-macos-x86_64
+        asset_name: logzod-macos-x86_64
+        asset_content_type: application/octet-stream
+
+    - name: Upload macOS ARM64 Binary
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./artifacts/logzod-macos-aarch64/logzod-macos-aarch64
+        asset_name: logzod-macos-aarch64
+        asset_content_type: application/octet-stream
