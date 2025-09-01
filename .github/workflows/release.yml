@@ -10,7 +10,7 @@ env:
 
 jobs:
   build:
-    name: Build for ${{ matrix.os }}
+    name: Build ${{ matrix.build_type }} for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -19,14 +19,32 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: logzod
             release_name: logzod-linux-x86_64
+            build_type: release
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: logzod
+            release_name: logzod-linux-x86_64-debug
+            build_type: debug
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: logzod
             release_name: logzod-macos-x86_64
+            build_type: release
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: logzod
+            release_name: logzod-macos-x86_64-debug
+            build_type: debug
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: logzod
             release_name: logzod-macos-aarch64
+            build_type: release
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: logzod
+            release_name: logzod-macos-aarch64-debug
+            build_type: debug
 
     steps:
     - name: Checkout logzod
@@ -61,12 +79,20 @@ jobs:
     - name: Build binary
       working-directory: logzod
       run: |
-        cargo build --release --target ${{ matrix.target }}
+        if [ "${{ matrix.build_type }}" = "release" ]; then
+          cargo build --release --target ${{ matrix.target }}
+        else
+          cargo build --target ${{ matrix.target }}
+        fi
 
     - name: Prepare binary
       working-directory: logzod
       run: |
-        cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.release_name }}
+        if [ "${{ matrix.build_type }}" = "release" ]; then
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.release_name }}
+        else
+          cp target/${{ matrix.target }}/debug/${{ matrix.artifact_name }} ${{ matrix.release_name }}
+        fi
         if [ "${{ matrix.os }}" = "macos-latest" ]; then
           # Sign the binary on macOS (optional, remove if you don't have signing set up)
           # codesign -s - ${{ matrix.release_name }}
@@ -116,13 +142,21 @@ jobs:
         body: |
           Automated release for commit ${{ github.sha }}
           
-          ## Binaries
-          - `logzod-linux-x86_64`: Linux x86_64 binary
-          - `logzod-macos-x86_64`: macOS x86_64 (Intel) binary  
-          - `logzod-macos-aarch64`: macOS ARM64 (Apple Silicon) binary
+          ## Release Binaries
+          - `logzod-linux-x86_64`: Linux x86_64 release binary
+          - `logzod-macos-x86_64`: macOS x86_64 (Intel) release binary  
+          - `logzod-macos-aarch64`: macOS ARM64 (Apple Silicon) release binary
+          
+          ## Debug Binaries
+          - `logzod-linux-x86_64-debug`: Linux x86_64 debug binary
+          - `logzod-macos-x86_64-debug`: macOS x86_64 (Intel) debug binary  
+          - `logzod-macos-aarch64-debug`: macOS ARM64 (Apple Silicon) debug binary
         draft: false
         prerelease: false
         files: |
           ./artifacts/logzod-linux-x86_64/logzod-linux-x86_64
+          ./artifacts/logzod-linux-x86_64-debug/logzod-linux-x86_64-debug
           ./artifacts/logzod-macos-x86_64/logzod-macos-x86_64
+          ./artifacts/logzod-macos-x86_64-debug/logzod-macos-x86_64-debug
           ./artifacts/logzod-macos-aarch64/logzod-macos-aarch64
+          ./artifacts/logzod-macos-aarch64-debug/logzod-macos-aarch64-debug
