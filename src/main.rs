@@ -765,7 +765,12 @@ impl RatelimitedLogPusher {
         let logs = state.collected.drain(..).collect::<Vec<_>>();
 
         if !logs.is_empty() {
-            state.tx.send(logs).await.expect("Failed to send logs");
+            if let Err(e) = state.tx.send(logs).await {
+                // The receiver can be dropped if the log processing task has panicked or exited.
+                // Instead of panicking here, we log the error. The logs that failed to send are now lost,
+                // but the pusher can continue operating if the receiver comes back (e.g. on app restart logic).
+                println!("[ERROR] Failed to send logs, receiver dropped: {}", e);
+            }
             state.last_push = Instant::now();
         }
     }
@@ -792,7 +797,11 @@ fn recurse_break_logs(
                 result.push(vec![MessageLogPayload {
                     timestamp: log.timestamp.clone(),
                     tag: log.tag,
-                    message: format!("{}... <log too long>", &log.message[..15260]),
+                    message: if log.message.len() > 15260 {
+                        format!("{}... <log too long>", &log.message[..15260])
+                    } else {
+                        format!("{}... <log too long>", log.message)
+                    },
                 }]);
                 continue;
             }
