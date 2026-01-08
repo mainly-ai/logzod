@@ -1,4 +1,5 @@
 use mirmod_rs::config::MirandaConfig;
+use url::Url;
 use mirmod_rs::orm::bigdecimal::ToPrimitive;
 use mirmod_rs::orm::ORMObject;
 use std::io::{BufRead, Error};
@@ -8,6 +9,7 @@ use sysinfo::{CpuExt, NetworkExt, System, SystemExt};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
+
 
 #[derive(Copy, Clone)]
 enum LogLevel {
@@ -378,6 +380,7 @@ async fn monitor_resources_and_logs(
 #[tokio::main]
 async fn main() {
     println!("📜 logzod");
+    let consumer_id = rand::random::<u32>();
     let token = std::env::var("WOB_TOKEN").expect("Expected a token in the environment");
     let docker_job_id = std::env::var("DOCKER_JOB_ID")
         .expect("Expected a docker job id in the environment")
@@ -405,7 +408,7 @@ async fn main() {
     let config = mirmod_rs::config::MirandaConfig::new_from_default()
         .expect("Failed to load default config from system paths")
         .merge_into_new(
-            mirmod_rs::config::PartialMirandaConfig::new_from_token_string(token).expect(
+            mirmod_rs::config::PartialMirandaConfig::new_from_token_string(token.clone()).expect(
                 "Failed to load partial config from token string (this should never happen)",
             ),
         )
@@ -424,6 +427,7 @@ async fn main() {
     mirmod_rs::orm::update(&mut sc, &mut ob)
         .await
         .expect("Failed to update docker job");
+    // PROBE
     mirmod_rs::orm::RealtimeMessage::send_to_ko(
         &mut sc,
         msg.wob_id,
@@ -464,61 +468,197 @@ async fn main() {
         // SELECT /* WAITING_FOR_EVENT ({}) */ SLEEP({})".format(self.wob_id,s)
         // if query is killed, set quit to false and break
         // otherwise, re-run the query, run in thread
-        let mut query_sc = sc.clone();
+        let mut _query_sc = sc.clone();
         let query_proc = proc.clone();
         let query_cdc_said_quit = cdc_said_quit.clone();
+        let metadata_id = ob.metadata_id();
+        let mq_default_pass = token.clone();
+
         let query_handle = tokio::spawn(async move {
             #[derive(serde::Deserialize)]
             struct EventPayload {
                 action: String,
             }
+            use async_trait::async_trait;
+            use sqlx::Row;
+            use std::path::Path;
             // Run a query that waits for an event or times out
             // If the query is killed, it means we should quit
-            loop {
-                mirmod_rs::orm::wait_for_cdc_event(
-                    &mut query_sc,
-                    format!("{}-logzod", msg.wob_id),
-                    30,
-                )
-                .await;
-                mirmod_rs::debug_println!("📜 sleep query timed out, polling for event");
-                let events = mirmod_rs::orm::WOBMessage::consume_queue(
-                    &mut query_sc,
-                    "logzod".into(),
-                    Some(msg.wob_id),
-                )
-                .await;
-                if let Ok(events) = events {
-                    for event in events {
-                        mirmod_rs::debug_println!("📜 event: {:?}", event);
-                        if let Ok(payload) = serde_json::from_value::<EventPayload>(event.payload) {
-                            if payload.action == "restart" {
-                                mirmod_rs::debug_println!(
-                                    "📜 restart event received, setting restart flag"
-                                );
-                                query_cdc_said_quit
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                mirmod_rs::debug_println!("📜 killing process");
-                                match query_proc.try_write() {
-                                    Ok(mut proc) => match proc.kill() {
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            println!("📜 Failed to kill process: {}", e);
-                                        }
-                                    },
-                                    Err(e) => {
-                                        println!("📜 Failed to kill process: {}", e);
-                                    }
-                                }
-                            }
-                        } else {
-                            mirmod_rs::debug_println!("📜 invalid event payload");
-                        }
-                    }
-                } else {
-                    mirmod_rs::debug_println!("📜 error consuming queue: {:?}", events);
-                    continue;
+            use amqprs::{
+                callbacks::{DefaultChannelCallback, DefaultConnectionCallback},
+                channel::{BasicConsumeArguments, QueueBindArguments, QueueDeclareArguments, BasicAckArguments},
+                connection::{Connection, OpenConnectionArguments},
+                consumer::AsyncConsumer,
+                tls::TlsAdaptor,
+                BasicProperties, Deliver,
+            };
+            use tokio::sync::mpsc;
+
+            #[derive(serde::Deserialize)]
+            struct LocalBotConfig {
+                rabbitmq_host: Option<String>,
+                rabbitmq_port: Option<u16>,
+                rabbitmq_cafile: Option<String>,
+                rabbitmq_vhost: Option<String>,
+                auth_token: Option<String>,
+            }
+
+            let local_config: Option<LocalBotConfig> = std::fs::read_to_string("localbot.yml")
+                .ok()
+                .and_then(|content| serde_yaml::from_str(&content).ok());
+
+            let rabbit_host = local_config.as_ref()
+                .and_then(|c| c.rabbitmq_host.clone())
+                .or_else(|| std::env::var("RABBITMQ_HOST").ok())
+                .unwrap_or_else(|| "127.0.0.1".into());
+
+            let rabbit_port = local_config.as_ref()
+                .and_then(|c| c.rabbitmq_port)
+                .unwrap_or_else(|| {
+                    std::env::var("RABBITMQ_PORT")
+                        .unwrap_or_else(|_| "5672".into())
+                        .parse::<u16>()
+                        .unwrap_or(5672)
+                });
+
+            let rabbit_user = match sqlx::query("SELECT substring(CURRENT_MIRANDA_USER(),LENGTH('miranda_')+1)")
+                .fetch_one(&_query_sc.pool)
+                .await
+            {
+                Ok(row) => row.get::<String, usize>(0),
+                Err(e) => {
+                    println!("📜 Failed to get rabbitmq user from db: {}", e);
+                    "guest".to_string()
                 }
+            };
+
+            let rabbit_pass = local_config.as_ref()
+                .and_then(|c| c.auth_token.clone())
+                .or_else(|| std::env::var("WOB_TOKEN").ok())
+                .unwrap_or(mq_default_pass);
+
+            let mut rabbit_vhost = local_config.as_ref()
+                .and_then(|c| c.rabbitmq_vhost.clone())
+                .or_else(|| std::env::var("RABBITMQ_VHOST").ok())
+                .unwrap_or_else(|| "/".into());
+
+            // amqprs uses just "/" or name, not encoded
+            if rabbit_vhost.trim().is_empty() {
+                rabbit_vhost = "/".into();
+            }
+            // Ensure no leading slash unless it's just root, amqprs might expect virtual host name directly
+            // Actually usually 'myvhost', but for root it is '/'. amqprs handles this.
+
+            let rabbit_cafile = local_config.as_ref()
+                .and_then(|c| c.rabbitmq_cafile.clone())
+                .or_else(|| std::env::var("RABBITMQ_CAFILE").ok());
+
+            let mut args = OpenConnectionArguments::new(&rabbit_host, rabbit_port, &rabbit_user, &rabbit_pass);
+            args.virtual_host(&rabbit_vhost);
+
+            if let Some(ca_path) = rabbit_cafile {
+                println!("🔒 Configuring TLS with custom CA: {}", ca_path);
+                // Enable TLS
+                match TlsAdaptor::without_client_auth(Some(Path::new(&ca_path)), rabbit_host.to_string()) {
+                    Ok(tls) => {
+                         args.tls_adaptor(tls);
+                    }
+                    Err(e) => {
+                        println!("⚠️ Failed to create TLS adaptor from CA file: {}", e);
+                    }
+                }
+            }
+
+            println!("🐰 Connecting to RabbitMQ at {}:{} vhost: {} using user: {} and password: {}", rabbit_host, rabbit_port, rabbit_vhost, rabbit_user, rabbit_pass);
+
+            let conn = Connection::open(&args)
+                .await
+                .expect("Failed to connect to RabbitMQ");
+
+            println!("🐰 Connected to RabbitMQ");
+
+            let channel = conn.open_channel(None).await.expect("Failed to open channel");
+            println!("📺 Channel created");
+
+            let queue_name = format!("logzod:{}.{}", metadata_id, consumer_id);
+            let routing_key = format!("{}", metadata_id);
+            println!("📥 Declaring queue: {}", queue_name);
+
+            let queue_args = QueueDeclareArguments::new(&queue_name)
+                .exclusive(true)
+                .auto_delete(true)
+                .finish();
+
+            let (queue_name, _, _) = channel
+                .queue_declare(queue_args)
+                .await
+                .expect("Failed to declare queue")
+                .expect("Queue declare failed");
+
+            println!("📥 Queue declared: {}", queue_name);
+
+            println!("🔗 Binding queue {} to exchange 'processors' with key {}", queue_name, routing_key);
+
+            channel
+                .queue_bind(QueueBindArguments::new(&queue_name, "processors", &routing_key))
+                .await
+                .expect("Failed to bind queue");
+
+            println!("🔗 Queue bound");
+
+            struct ForwardingConsumer {
+                tx: mpsc::Sender<(u64, Vec<u8>)>,
+            }
+
+            #[async_trait]
+            impl AsyncConsumer for ForwardingConsumer {
+                async fn consume(
+                    &mut self,
+                    _channel: &amqprs::channel::Channel,
+                    deliver: Deliver,
+                    _basic_properties: BasicProperties,
+                    content: Vec<u8>,
+                ) {
+                   // Forward delivery tag and content
+                   if let Err(e) = self.tx.send((deliver.delivery_tag(), content)).await {
+                       println!("⚠️ Failed to forward message to loop: {}", e);
+                   }
+                }
+            }
+
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+
+            println!("🎧 Creating consumer for queue {}", queue_name);
+            let consumer_args = BasicConsumeArguments::new(&queue_name, "logzod_consumer")
+                .manual_ack(true)
+                .finish();
+
+            channel
+                .basic_consume(ForwardingConsumer { tx: msg_tx }, consumer_args)
+                .await
+                .expect("Failed to create consumer");
+
+            println!("🎧 Consumer created");
+
+            while let Some((delivery_tag, data)) = msg_rx.recv().await {
+                println!("📨 Message received");
+                if let Ok(payload) = serde_json::from_slice::<EventPayload>(&data) {
+                    if payload.action == "restart" || payload.action == "stop" {
+                         mirmod_rs::debug_println!("📜 {} event received", payload.action);
+                         query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
+                         mirmod_rs::debug_println!("📜 killing process");
+                         match query_proc.try_write() {
+                             Ok(mut proc) => {
+                                 proc.kill().ok();
+                             }
+                             Err(e) => {
+                                 println!("📜 Failed to access process lock: {}", e);
+                             }
+                         }
+                    }
+                }
+                // Ack the message using the channel
+                channel.basic_ack(BasicAckArguments::new(delivery_tag, false)).await.ok();
             }
         });
 
