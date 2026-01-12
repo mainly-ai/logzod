@@ -558,8 +558,17 @@ async fn main() {
 
             if let Some(ca_path) = rabbit_cafile {
                 println!("🔒 Configuring TLS with custom CA: {}", ca_path);
+
+                let domain = if rabbit_host == "127.0.0.1" {
+                    "localhost".to_string()
+                } else {
+                    rabbit_host.clone()
+                };
+
+                println!("🔒 Using TLS domain: {}", domain);
+
                 // Enable TLS
-                match TlsAdaptor::without_client_auth(Some(Path::new(&ca_path)), rabbit_host.to_string()) {
+                match TlsAdaptor::without_client_auth(Some(Path::new(&ca_path)), domain) {
                     Ok(tls) => {
                          args.tls_adaptor(tls);
                     }
