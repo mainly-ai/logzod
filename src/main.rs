@@ -1,5 +1,4 @@
 use mirmod_rs::config::MirandaConfig;
-use url::Url;
 use mirmod_rs::orm::bigdecimal::ToPrimitive;
 use mirmod_rs::orm::ORMObject;
 use std::io::{BufRead, Error};
@@ -9,7 +8,6 @@ use sysinfo::{CpuExt, NetworkExt, System, SystemExt};
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
-
 
 #[derive(Copy, Clone)]
 enum LogLevel {
@@ -486,7 +484,10 @@ async fn main() {
             // If the query is killed, it means we should quit
             use amqprs::{
                 callbacks::{DefaultChannelCallback, DefaultConnectionCallback},
-                channel::{BasicConsumeArguments, QueueBindArguments, QueueDeclareArguments, BasicAckArguments},
+                channel::{
+                    BasicAckArguments, BasicConsumeArguments, QueueBindArguments,
+                    QueueDeclareArguments,
+                },
                 connection::{Connection, OpenConnectionArguments},
                 consumer::AsyncConsumer,
                 tls::TlsAdaptor,
@@ -507,12 +508,14 @@ async fn main() {
                 .ok()
                 .and_then(|content| serde_yaml::from_str(&content).ok());
 
-            let rabbit_host = local_config.as_ref()
+            let rabbit_host = local_config
+                .as_ref()
                 .and_then(|c| c.rabbitmq_host.clone())
                 .or_else(|| std::env::var("RABBITMQ_HOST").ok())
                 .unwrap_or_else(|| "127.0.0.1".into());
 
-            let rabbit_port = local_config.as_ref()
+            let rabbit_port = local_config
+                .as_ref()
                 .and_then(|c| c.rabbitmq_port)
                 .unwrap_or_else(|| {
                     std::env::var("RABBITMQ_PORT")
@@ -521,23 +524,26 @@ async fn main() {
                         .unwrap_or(5672)
                 });
 
-            let rabbit_user = match sqlx::query("SELECT substring(CURRENT_MIRANDA_USER(),LENGTH('miranda_')+1)")
-                .fetch_one(&_query_sc.pool)
-                .await
-            {
-                Ok(row) => row.get::<String, usize>(0),
-                Err(e) => {
-                    println!("📜 Failed to get rabbitmq user from db: {}", e);
-                    "guest".to_string()
-                }
-            };
+            let rabbit_user =
+                match sqlx::query("SELECT substring(CURRENT_MIRANDA_USER(),LENGTH('miranda_')+1)")
+                    .fetch_one(&_query_sc.pool)
+                    .await
+                {
+                    Ok(row) => row.get::<String, usize>(0),
+                    Err(e) => {
+                        println!("📜 Failed to get rabbitmq user from db: {}", e);
+                        "guest".to_string()
+                    }
+                };
 
-            let rabbit_pass = local_config.as_ref()
+            let rabbit_pass = local_config
+                .as_ref()
                 .and_then(|c| c.auth_token.clone())
                 .or_else(|| std::env::var("WOB_TOKEN").ok())
                 .unwrap_or(mq_default_pass);
 
-            let mut rabbit_vhost = local_config.as_ref()
+            let mut rabbit_vhost = local_config
+                .as_ref()
                 .and_then(|c| c.rabbitmq_vhost.clone())
                 .or_else(|| std::env::var("RABBITMQ_VHOST").ok())
                 .unwrap_or_else(|| "/".into());
@@ -549,11 +555,13 @@ async fn main() {
             // Ensure no leading slash unless it's just root, amqprs might expect virtual host name directly
             // Actually usually 'myvhost', but for root it is '/'. amqprs handles this.
 
-            let rabbit_cafile = local_config.as_ref()
+            let rabbit_cafile = local_config
+                .as_ref()
                 .and_then(|c| c.rabbitmq_cafile.clone())
                 .or_else(|| std::env::var("RABBITMQ_CAFILE").ok());
 
-            let mut args = OpenConnectionArguments::new(&rabbit_host, rabbit_port, &rabbit_user, &rabbit_pass);
+            let mut args =
+                OpenConnectionArguments::new(&rabbit_host, rabbit_port, &rabbit_user, &rabbit_pass);
             args.virtual_host(&rabbit_vhost);
 
             if let Some(ca_path) = rabbit_cafile {
@@ -570,7 +578,7 @@ async fn main() {
                 // Enable TLS
                 match TlsAdaptor::without_client_auth(Some(Path::new(&ca_path)), domain) {
                     Ok(tls) => {
-                         args.tls_adaptor(tls);
+                        args.tls_adaptor(tls);
                     }
                     Err(e) => {
                         println!("⚠️ Failed to create TLS adaptor from CA file: {}", e);
@@ -578,7 +586,10 @@ async fn main() {
                 }
             }
 
-            println!("🐰 Connecting to RabbitMQ at {}:{} vhost: {} using user: {} and password: {}", rabbit_host, rabbit_port, rabbit_vhost, rabbit_user, rabbit_pass);
+            println!(
+                "🐰 Connecting to RabbitMQ at {}:{} vhost: {} using user: {} and password: {}",
+                rabbit_host, rabbit_port, rabbit_vhost, rabbit_user, rabbit_pass
+            );
 
             let conn = Connection::open(&args)
                 .await
@@ -586,7 +597,10 @@ async fn main() {
 
             println!("🐰 Connected to RabbitMQ");
 
-            let channel = conn.open_channel(None).await.expect("Failed to open channel");
+            let channel = conn
+                .open_channel(None)
+                .await
+                .expect("Failed to open channel");
             println!("📺 Channel created");
 
             let queue_name = format!("logzod:{}.{}", metadata_id, consumer_id);
@@ -606,10 +620,17 @@ async fn main() {
 
             println!("📥 Queue declared: {}", queue_name);
 
-            println!("🔗 Binding queue {} to exchange 'processors' with key {}", queue_name, routing_key);
+            println!(
+                "🔗 Binding queue {} to exchange 'processors' with key {}",
+                queue_name, routing_key
+            );
 
             channel
-                .queue_bind(QueueBindArguments::new(&queue_name, "processors", &routing_key))
+                .queue_bind(QueueBindArguments::new(
+                    &queue_name,
+                    "processors",
+                    &routing_key,
+                ))
                 .await
                 .expect("Failed to bind queue");
 
@@ -628,10 +649,10 @@ async fn main() {
                     _basic_properties: BasicProperties,
                     content: Vec<u8>,
                 ) {
-                   // Forward delivery tag and content
-                   if let Err(e) = self.tx.send((deliver.delivery_tag(), content)).await {
-                       println!("⚠️ Failed to forward message to loop: {}", e);
-                   }
+                    // Forward delivery tag and content
+                    if let Err(e) = self.tx.send((deliver.delivery_tag(), content)).await {
+                        println!("⚠️ Failed to forward message to loop: {}", e);
+                    }
                 }
             }
 
@@ -653,21 +674,24 @@ async fn main() {
                 println!("📨 Message received");
                 if let Ok(payload) = serde_json::from_slice::<EventPayload>(&data) {
                     if payload.action == "restart" || payload.action == "stop" {
-                         mirmod_rs::debug_println!("📜 {} event received", payload.action);
-                         query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
-                         mirmod_rs::debug_println!("📜 killing process");
-                         match query_proc.try_write() {
-                             Ok(mut proc) => {
-                                 proc.kill().ok();
-                             }
-                             Err(e) => {
-                                 println!("📜 Failed to access process lock: {}", e);
-                             }
-                         }
+                        mirmod_rs::debug_println!("📜 {} event received", payload.action);
+                        query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
+                        mirmod_rs::debug_println!("📜 killing process");
+                        match query_proc.try_write() {
+                            Ok(mut proc) => {
+                                proc.kill().ok();
+                            }
+                            Err(e) => {
+                                println!("📜 Failed to access process lock: {}", e);
+                            }
+                        }
                     }
                 }
                 // Ack the message using the channel
-                channel.basic_ack(BasicAckArguments::new(delivery_tag, false)).await.ok();
+                channel
+                    .basic_ack(BasicAckArguments::new(delivery_tag, false))
+                    .await
+                    .ok();
             }
         });
 
