@@ -480,20 +480,17 @@ async fn main() {
             use async_trait::async_trait;
             use sqlx::Row;
             use std::path::Path;
-            // Run a query that waits for an event or times out
-            // If the query is killed, it means we should quit
             use amqprs::{
-                callbacks::{DefaultChannelCallback, DefaultConnectionCallback},
-                channel::{
-                    BasicAckArguments, BasicConsumeArguments, QueueBindArguments,
-                    QueueDeclareArguments,
-                },
+                callbacks::ConnectionCallback,
+                channel::{BasicConsumeArguments, QueueBindArguments, QueueDeclareArguments, BasicAckArguments},
                 connection::{Connection, OpenConnectionArguments},
                 consumer::AsyncConsumer,
                 tls::TlsAdaptor,
                 BasicProperties, Deliver,
+                Close,
             };
             use tokio::sync::mpsc;
+            use std::time::Duration;
 
             #[derive(serde::Deserialize)]
             struct LocalBotConfig {
@@ -502,6 +499,41 @@ async fn main() {
                 rabbitmq_cafile: Option<String>,
                 rabbitmq_vhost: Option<String>,
                 auth_token: Option<String>,
+            }
+
+            struct RabbitMqCallback {
+                tx: mpsc::Sender<()>,
+            }
+
+            #[async_trait]
+            impl ConnectionCallback for RabbitMqCallback {
+                async fn close(&mut self, _connection: &Connection, _reason: Close) -> Result<(), amqprs::error::Error> {
+                    println!("RabbitMQ connection closed");
+                    let _ = self.tx.send(()).await;
+                    Ok(())
+                }
+                async fn blocked(&mut self, _connection: &Connection, _reason: String) {}
+                async fn unblocked(&mut self, _connection: &Connection) {}
+            }
+
+            struct ForwardingConsumer {
+                tx: mpsc::Sender<(u64, Vec<u8>)>,
+            }
+
+            #[async_trait]
+            impl AsyncConsumer for ForwardingConsumer {
+                async fn consume(
+                    &mut self,
+                    _channel: &amqprs::channel::Channel,
+                    deliver: Deliver,
+                    _basic_properties: BasicProperties,
+                    content: Vec<u8>,
+                ) {
+                   // Forward delivery tag and content
+                   if let Err(e) = self.tx.send((deliver.delivery_tag(), content)).await {
+                       println!("⚠️ Failed to forward message to loop: {}", e);
+                   }
+                }
             }
 
             let local_config: Option<LocalBotConfig> = std::fs::read_to_string("localbot.yml")
@@ -540,7 +572,7 @@ async fn main() {
                 .as_ref()
                 .and_then(|c| c.auth_token.clone())
                 .or_else(|| std::env::var("WOB_TOKEN").ok())
-                .unwrap_or(mq_default_pass);
+                .unwrap_or_else(|| mq_default_pass.clone());
 
             let mut rabbit_vhost = local_config
                 .as_ref()
@@ -560,140 +592,149 @@ async fn main() {
                 .and_then(|c| c.rabbitmq_cafile.clone())
                 .or_else(|| std::env::var("RABBITMQ_CAFILE").ok());
 
-            let mut args =
-                OpenConnectionArguments::new(&rabbit_host, rabbit_port, &rabbit_user, &rabbit_pass);
-            args.virtual_host(&rabbit_vhost);
+            let domain = std::env::var("RABBITMQ_TLS_ALTNAME").unwrap_or_else(|_| {
+                if rabbit_host == "127.0.0.1" {
+                    "localhost".to_string()
+                } else {
+                    rabbit_host.clone()
+                }
+            });
 
-            if let Some(ca_path) = rabbit_cafile {
-                println!("🔒 Configuring TLS with custom CA: {}", ca_path);
+            loop {
+                let (reconnect_tx, mut reconnect_rx) = mpsc::channel(1);
 
-                let domain = std::env::var("RABBITMQ_TLS_ALTNAME").unwrap_or_else(|_| {
-                    if rabbit_host == "127.0.0.1" {
-                        "localhost".to_string()
-                    } else {
-                        rabbit_host.clone()
+                let mut args = OpenConnectionArguments::new(&rabbit_host, rabbit_port, &rabbit_user, &rabbit_pass);
+                args.virtual_host(&rabbit_vhost);
+                args.heartbeat(10); // Set heartbeat to 10 seconds
+
+                if let Some(ca_path) = &rabbit_cafile {
+                    println!("🔒 Configuring TLS with custom CA: {}", ca_path);
+                    println!("🔒 Using TLS domain: {}", domain);
+
+                    // Enable TLS
+                    match TlsAdaptor::without_client_auth(Some(Path::new(&ca_path)), domain.clone()) {
+                         Ok(tls) => {
+                              args.tls_adaptor(tls);
+                         }
+                         Err(e) => {
+                             println!("⚠️ Failed to create TLS adaptor from CA file: {}", e);
+                         }
                     }
-                });
+                }
 
-                println!("🔒 Using TLS domain: {}", domain);
+                println!("🐰 Connecting to RabbitMQ at {}:{} vhost: {} using user: {} and password: {}", rabbit_host, rabbit_port, rabbit_vhost, rabbit_user, rabbit_pass);
 
-                // Enable TLS
-                match TlsAdaptor::without_client_auth(Some(Path::new(&ca_path)), domain) {
-                    Ok(tls) => {
-                        args.tls_adaptor(tls);
-                    }
+                let conn = match Connection::open(&args).await {
+                    Ok(c) => c,
                     Err(e) => {
-                        println!("⚠️ Failed to create TLS adaptor from CA file: {}", e);
+                        println!("Failed to connect to RabbitMQ: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
+
+                // Register callback
+                if let Err(e) = conn.register_callback(RabbitMqCallback { tx: reconnect_tx }).await {
+                     println!("Failed to register callback: {}", e);
+                }
+
+                println!("🐰 Connected to RabbitMQ");
+
+                let channel = match conn.open_channel(None).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                         println!("Failed to open channel: {}", e);
+                         tokio::time::sleep(Duration::from_secs(5)).await;
+                         continue;
+                    }
+                };
+                println!("📺 Channel created");
+
+                let queue_name = format!("logzod:{}.{}", metadata_id, consumer_id);
+                let routing_key = format!("{}", metadata_id);
+                println!("📥 Declaring queue: {}", queue_name);
+
+                let queue_args = QueueDeclareArguments::new(&queue_name)
+                    .exclusive(true)
+                    .auto_delete(true)
+                    .finish();
+
+                match channel.queue_declare(queue_args).await {
+                    Ok(Some((name, _, _))) => {
+                        println!("📥 Queue declared: {}", name);
+                    },
+                    Ok(None) => {
+                         println!("📥 Queue declared (no data returned)");
+                    },
+                    Err(e) => {
+                         println!("Failed to declare queue: {}", e);
+                         tokio::time::sleep(Duration::from_secs(5)).await;
+                         continue;
                     }
                 }
-            }
 
-            println!(
-                "🐰 Connecting to RabbitMQ at {}:{} vhost: {} using user: {} and password: {}",
-                rabbit_host, rabbit_port, rabbit_vhost, rabbit_user, rabbit_pass
-            );
+                println!("🔗 Binding queue {} to exchange 'processors' with key {}", queue_name, routing_key);
 
-            let conn = Connection::open(&args)
-                .await
-                .expect("Failed to connect to RabbitMQ");
-
-            println!("🐰 Connected to RabbitMQ");
-
-            let channel = conn
-                .open_channel(None)
-                .await
-                .expect("Failed to open channel");
-            println!("📺 Channel created");
-
-            let queue_name = format!("logzod:{}.{}", metadata_id, consumer_id);
-            let routing_key = format!("{}", metadata_id);
-            println!("📥 Declaring queue: {}", queue_name);
-
-            let queue_args = QueueDeclareArguments::new(&queue_name)
-                .exclusive(true)
-                .auto_delete(true)
-                .finish();
-
-            let (queue_name, _, _) = channel
-                .queue_declare(queue_args)
-                .await
-                .expect("Failed to declare queue")
-                .expect("Queue declare failed");
-
-            println!("📥 Queue declared: {}", queue_name);
-
-            println!(
-                "🔗 Binding queue {} to exchange 'processors' with key {}",
-                queue_name, routing_key
-            );
-
-            channel
-                .queue_bind(QueueBindArguments::new(
-                    &queue_name,
-                    "processors",
-                    &routing_key,
-                ))
-                .await
-                .expect("Failed to bind queue");
-
-            println!("🔗 Queue bound");
-
-            struct ForwardingConsumer {
-                tx: mpsc::Sender<(u64, Vec<u8>)>,
-            }
-
-            #[async_trait]
-            impl AsyncConsumer for ForwardingConsumer {
-                async fn consume(
-                    &mut self,
-                    _channel: &amqprs::channel::Channel,
-                    deliver: Deliver,
-                    _basic_properties: BasicProperties,
-                    content: Vec<u8>,
-                ) {
-                    // Forward delivery tag and content
-                    if let Err(e) = self.tx.send((deliver.delivery_tag(), content)).await {
-                        println!("⚠️ Failed to forward message to loop: {}", e);
+                match channel.queue_bind(QueueBindArguments::new(&queue_name, "processors", &routing_key)).await {
+                    Ok(_) => {
+                        println!("🔗 Queue bound");
+                    },
+                     Err(e) => {
+                         println!("Failed to bind queue: {}", e);
+                         tokio::time::sleep(Duration::from_secs(5)).await;
+                         continue;
                     }
                 }
-            }
 
-            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+                let (msg_tx, mut msg_rx) = mpsc::channel(100);
 
-            println!("🎧 Creating consumer for queue {}", queue_name);
-            let consumer_args = BasicConsumeArguments::new(&queue_name, "logzod_consumer")
-                .manual_ack(true)
-                .finish();
+                println!("🎧 Creating consumer for queue {}", queue_name);
+                let consumer_args = BasicConsumeArguments::new(&queue_name, "logzod_consumer")
+                    .manual_ack(true)
+                    .finish();
 
-            channel
-                .basic_consume(ForwardingConsumer { tx: msg_tx }, consumer_args)
-                .await
-                .expect("Failed to create consumer");
+                match channel.basic_consume(ForwardingConsumer { tx: msg_tx }, consumer_args).await {
+                     Ok(_) => {
+                         println!("🎧 Consumer created");
+                     },
+                     Err(e) => {
+                         println!("Failed to create consumer: {}", e);
+                         tokio::time::sleep(Duration::from_secs(5)).await;
+                         continue;
+                    }
+                }
 
-            println!("🎧 Consumer created");
-
-            while let Some((delivery_tag, data)) = msg_rx.recv().await {
-                println!("📨 Message received");
-                if let Ok(payload) = serde_json::from_slice::<EventPayload>(&data) {
-                    if payload.action == "restart" || payload.action == "stop" {
-                        mirmod_rs::debug_println!("📜 {} event received", payload.action);
-                        query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
-                        mirmod_rs::debug_println!("📜 killing process");
-                        match query_proc.try_write() {
-                            Ok(mut proc) => {
-                                proc.kill().ok();
+                // Inner loop: consume messages until disconnect or quit
+                loop {
+                    tokio::select! {
+                        Some((delivery_tag, data)) = msg_rx.recv() => {
+                            println!("📨 Message received");
+                            if let Ok(payload) = serde_json::from_slice::<EventPayload>(&data) {
+                                if payload.action == "restart" || payload.action == "stop" {
+                                     mirmod_rs::debug_println!("📜 {} event received", payload.action);
+                                     query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
+                                     mirmod_rs::debug_println!("📜 killing process");
+                                     match query_proc.try_write() {
+                                         Ok(mut proc) => {
+                                             proc.kill().ok();
+                                         }
+                                         Err(e) => {
+                                             println!("📜 Failed to access process lock: {}", e);
+                                         }
+                                     }
+                                }
                             }
-                            Err(e) => {
-                                println!("📜 Failed to access process lock: {}", e);
-                            }
+                            // Ack the message using the channel
+                            channel.basic_ack(BasicAckArguments::new(delivery_tag, false)).await.ok();
+                        }
+                        _ = reconnect_rx.recv() => {
+                            println!("RabbitMQ connection lost. Reconnecting...");
+                            break;
                         }
                     }
                 }
-                // Ack the message using the channel
-                channel
-                    .basic_ack(BasicAckArguments::new(delivery_tag, false))
-                    .await
-                    .ok();
+
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
 
