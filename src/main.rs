@@ -475,7 +475,7 @@ async fn main() {
         let query_handle = tokio::spawn(async move {
             #[derive(serde::Deserialize)]
             struct EventPayload {
-                action: String,
+                command: String,
             }
             use async_trait::async_trait;
             use sqlx::Row;
@@ -710,8 +710,8 @@ async fn main() {
                         Some((delivery_tag, data)) = msg_rx.recv() => {
                             println!("📨 Message received");
                             if let Ok(payload) = serde_json::from_slice::<EventPayload>(&data) {
-                                if payload.action == "restart" || payload.action == "stop" {
-                                     mirmod_rs::debug_println!("📜 {} event received", payload.action);
+                                if payload.command == "restart" || payload.command == "stop" {
+                                     mirmod_rs::debug_println!("📜 {} event received", payload.command);
                                      query_cdc_said_quit.store(true, std::sync::atomic::Ordering::Relaxed);
                                      mirmod_rs::debug_println!("📜 killing process");
                                      match query_proc.try_write() {
